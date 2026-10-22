@@ -40,12 +40,45 @@ class Flux2NetworkTrainer(NetworkTrainer):
         return self.model_version_info.architecture_full
 
     def handle_model_specific_args(self, args):
+        from musubi_tuner.training.flux2_validation import validate_validation_args
+
+        validate_validation_args(args)
         self.model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
         self.dit_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
         self._i2v_training = False
         self._control_training = False  # this means video training, not control image training
         self.default_guidance_scale = 4.0  # CFG scale for inference for base models
         self.default_discrete_flow_shift = None  # Use FLUX.2 shift as default
+
+    def _build_dataset(self, args):
+        result = super()._build_dataset(args)
+        if getattr(args, "validation_dataset_config", None):
+            from musubi_tuner.training.flux2_validation import build_validation_loader
+
+            self.validation_loader = build_validation_loader(args, self.architecture, result[0])
+        return result
+
+    def on_completed_optimizer_step(
+        self, args, accelerator, network, transformer, noise_scheduler, dit_dtype, network_dtype, global_step
+    ):
+        if not getattr(args, "validation_dataset_config", None):
+            return
+        if global_step % args.validation_every_n_steps:
+            return
+        from musubi_tuner.training.flux2_validation import evaluate_validation
+
+        # Every rank evaluates the same fixed data. No sampler padding, sharding, or rank-specific noise.
+        metrics = evaluate_validation(
+            self, args, accelerator, network, transformer, self.validation_loader,
+            noise_scheduler, dit_dtype, network_dtype, global_step,
+        )
+        logger.info("Validation step %s: loss=%.6f, samples=%s", global_step, metrics["val/loss"], metrics["val/num_samples"])
+        if accelerator.trackers:
+            accelerator.log(metrics, step=global_step)
+
+    def extra_step_logs(self, args, logs):
+        # Keep historical loss/current and loss/average intact.
+        return {"train/loss": logs["loss/current"]}
 
     def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
         device = accelerator.device
@@ -297,7 +330,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
         ctx, ctx_ids = flux2_utils.prc_txt(ctx_vec)  # [B, 512, 15360], [B, 512, 4]
 
         # ensure the hidden state will require grad
-        if args.gradient_checkpointing:
+        if args.gradient_checkpointing and torch.is_grad_enabled():
             noisy_model_input.requires_grad_(True)
             ctx.requires_grad_(True)
             if ref_tokens is not None:
@@ -343,6 +376,10 @@ def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument("--text_encoder", type=str, default=None, help="text encoder checkpoint path")
     parser.add_argument("--fp8_text_encoder", action="store_true", help="use fp8 for Text Encoder model")
     flux2_utils.add_model_version_args(parser)
+    parser.add_argument("--validation_dataset_config", type=str, default=None, help="Separate held-out cached image dataset TOML")
+    parser.add_argument("--validation_every_n_steps", type=int, default=None, help="Evaluate every N completed optimizer steps")
+    parser.add_argument("--validation_max_batches", type=int, default=None, help="Maximum singleton validation batches; default: all")
+    parser.add_argument("--validation_seed", type=int, default=42, help="Stable per-example validation noise/timestep seed")
     return parser
 
 

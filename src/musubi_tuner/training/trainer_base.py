@@ -1341,6 +1341,11 @@ class NetworkTrainer:
         Use for EMA updates or any post-step bookkeeping.
         """
 
+    def on_completed_optimizer_step(
+        self, args, accelerator, network, transformer, noise_scheduler, dit_dtype, network_dtype, global_step
+    ) -> None:
+        """Called outside accumulation, after sampling/saving, at the completed optimizer-step axis."""
+
     def on_post_save(
         self,
         args: argparse.Namespace,
@@ -2250,6 +2255,10 @@ class NetworkTrainer:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
                                     remove_model(remove_ckpt_name)
                         optimizer_train_fn()
+
+                    self.on_completed_optimizer_step(
+                        args, accelerator, network, transformer, noise_scheduler, dit_dtype, network_dtype, global_step
+                    )
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)

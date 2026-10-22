@@ -156,6 +156,9 @@ python src/musubi_tuner/flux_2_cache_text_encoder_outputs.py \
 
 ## Training / 学習
 
+For optional held-out paired-image validation loss, reproducible dataset splitting, Windows
+cache/training commands, and TensorBoard metrics, see [FLUX.2 validation loss](./flux_2_validation.md).
+
 Training uses a dedicated script `flux_2_train_network.py`.
 
 ```bash

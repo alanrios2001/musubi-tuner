@@ -1,0 +1,12 @@
+[general]
+resolution = [768, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = true
+
+[[datasets]]
+image_directory = "datasets/remove_clothes/train/target"
+control_directory = "datasets/remove_clothes/train/original"
+cache_directory = "datasets/remove_clothes/cache_train"
+num_repeats = 1
