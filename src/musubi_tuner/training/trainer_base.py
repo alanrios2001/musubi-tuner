@@ -2057,6 +2057,10 @@ class NetworkTrainer:
 
         epoch_to_start = 0
         global_step = 0
+        if getattr(args, "loraga", False):
+            epoch_to_start = self._loraga_progress["epoch"]
+            global_step = self._loraga_progress["global_step"]
+            progress_bar.update(global_step)
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
@@ -2166,7 +2170,17 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
-            for step, batch in enumerate(train_dataloader):
+            epoch_loader = train_dataloader
+            first_batch = 0
+            if getattr(args, "loraga", False):
+                # Private generator recreates sampler order without consuming training RNG.
+                generator = torch.Generator().manual_seed((args.seed or args.loraga_seed) + epoch)
+                train_dataloader.generator = generator
+                train_dataloader.batch_sampler.sampler.generator = generator
+                first_batch = self._loraga_progress["next_batch"] if epoch == epoch_to_start else 0
+                epoch_loader = accelerate.skip_first_batches(train_dataloader, first_batch) if first_batch else train_dataloader
+
+            for step, batch in enumerate(epoch_loader, start=first_batch):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = batch["latents"]
@@ -2231,6 +2245,8 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    if getattr(args, "loraga", False):
+                        self._loraga_progress = {"global_step": global_step, "epoch": epoch, "next_batch": step + 1}
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)

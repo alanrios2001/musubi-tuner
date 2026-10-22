@@ -850,6 +850,14 @@ class LoRANetwork(torch.nn.Module):
             metadata = None
 
         state_dict = self.state_dict()
+        if getattr(self, "loraga_initial", None) is not None:
+            from musubi_tuner.networks.loraga import converted_state_dict
+
+            state_dict = converted_state_dict(state_dict, self.loraga_initial)
+            metadata = dict(metadata or {})
+            metadata["ss_network_dim"] = str(2 * next(iter(self.loraga_initial.values()))[0].shape[0])
+            metadata["ss_network_alpha"] = str(float(next(iter(state_dict[k] for k in state_dict if k.endswith(".alpha")))))
+            metadata["ss_loraga_export"] = "exact_difference_rank_2r"
 
         if dtype is not None:
             for key in list(state_dict.keys()):

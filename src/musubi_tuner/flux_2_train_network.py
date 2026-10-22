@@ -57,6 +57,8 @@ class Flux2NetworkTrainer(NetworkTrainer):
         result = super()._build_dataset(args)
         if getattr(args, "loraga", False):
             self._loraga_dataset = result[:2]
+            self._loraga_training_group = result[0]
+            self._loraga_progress = {"global_step": 0, "epoch": 0, "next_batch": 0}
         if getattr(args, "validation_dataset_config", None):
             from musubi_tuner.training.flux2_validation import build_validation_loader
 
@@ -290,8 +292,10 @@ class Flux2NetworkTrainer(NetworkTrainer):
         )
         if loraga:
             from musubi_tuner.training.flux2_loraga import initialize
+            from musubi_tuner.training.flux2_validation import isolated_rng
 
-            model = initialize(self, args, accelerator, model)
+            with isolated_rng():
+                model = initialize(self, args, accelerator, model)
         return model
 
     def _build_network(self, args, accelerator, transformer, vae, weight_dtype):
@@ -305,6 +309,14 @@ class Flux2NetworkTrainer(NetworkTrainer):
             # Plain CPU tensors: excluded from optimizer, accelerator state and device moves.
             network.loraga_initial = self._loraga_initial
         return network
+
+    def _register_hooks_and_resume(self, args, accelerator, network):
+        if getattr(args, "loraga", False):
+            from musubi_tuner.training.flux2_loraga import register_resume
+
+            self._loraga_saved_metrics = dict(self._loraga_metrics)
+            register_resume(self, args, accelerator, network)
+        super()._register_hooks_and_resume(args, accelerator, network)
 
     def compile_transformer(self, args, transformer):
         transformer: flux2_models.Flux2 = transformer

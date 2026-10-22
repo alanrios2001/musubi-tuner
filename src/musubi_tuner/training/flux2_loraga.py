@@ -59,6 +59,8 @@ def validate_args(args):
         raise ValueError("LoRA-GA stable_gamma must be finite and positive")
     if args.resume_from_huggingface:
         raise ValueError("LoRA-GA resume requires a local Accelerate state directory")
+    if args.max_data_loader_n_workers != 0 or args.persistent_data_loader_workers:
+        raise ValueError("LoRA-GA deterministic resume currently requires --max_data_loader_n_workers 0 without persistent workers")
     if resume and not (resume / CACHE_NAME).is_file():
         raise ValueError(f"Missing LoRA-GA initialization state: {resume / CACHE_NAME}")
 
@@ -208,20 +210,8 @@ def estimate(trainer, args, accelerator, model, network, targets, group, collato
 
 def compensate(model, initial, targets, scaling, fp8, max_ratio):
     """Compensate one CPU matrix at a time; compare native FP8 rounding errors."""
-    from musubi_tuner.modules.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
-    from musubi_tuner.flux_2.flux2_models import FP8_OPTIMIZATION_TARGET_KEYS, FP8_OPTIMIZATION_EXCLUDE_KEYS
-
     sums = [0.0, 0.0, 0.0]
     count = 0
-
-    def quantized(weight):
-        from musubi_tuner.modules.fp8_optimization_utils import quantize_weight
-
-        q, scale = quantize_weight("loraga.weight", weight, torch.float8_e4m3fn, 448.0, -448.0)
-        scale = scale.to(weight.dtype).float()
-        if scale.ndim == 3:
-            return (q.float().reshape(scale.shape[0], scale.shape[1], -1) * scale).reshape(weight.shape)
-        return q.float() * scale
 
     for name, module in targets.items():
         a, b = initial[name]
@@ -230,8 +220,8 @@ def compensate(model, initial, targets, scaling, fp8, max_ratio):
         residual = (original - offset).to(torch.bfloat16)
         sums[0] += (residual.float() + offset - original).square().sum().item()
         if fp8:
-            sums[1] += (quantized(module.weight.detach()) - original).square().sum().item()
-            sums[2] += (quantized(residual) + offset - original).square().sum().item()
+            sums[1] += (quantized(module.weight.detach()).float() - original).square().sum().item()
+            sums[2] += (quantized(residual).float() + offset - original).square().sum().item()
         count += original.numel()
         module.weight.data = residual
     metrics = {"loraga/compensation_weight_rmse": math.sqrt(sums[0] / count)}
@@ -243,12 +233,52 @@ def compensate(model, initial, targets, scaling, fp8, max_ratio):
         if ratio > max_ratio:
             raise ValueError(f"LoRA-GA FP8 weight RMSE ratio {ratio:.6g} exceeds configured limit {max_ratio}; "
                              "initialization cache remains reusable. Inspect scaling before explicitly changing the limit.")
-        state = model.state_dict()
-        optimize_state_dict_with_fp8(state, "cpu", FP8_OPTIMIZATION_TARGET_KEYS, FP8_OPTIMIZATION_EXCLUDE_KEYS)
-        apply_fp8_monkey_patch(model, state, use_scaled_mm=False)
-        model.load_state_dict(state, strict=True, assign=True)
     logger.info("LoRA-GA initialization metrics: %s", metrics)
     return metrics
+
+
+def quantize_model(model):
+    from musubi_tuner.modules.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
+    from musubi_tuner.flux_2.flux2_models import FP8_OPTIMIZATION_TARGET_KEYS, FP8_OPTIMIZATION_EXCLUDE_KEYS
+
+    state = model.state_dict()
+    optimize_state_dict_with_fp8(state, "cpu", FP8_OPTIMIZATION_TARGET_KEYS, FP8_OPTIMIZATION_EXCLUDE_KEYS)
+    apply_fp8_monkey_patch(model, state, use_scaled_mm=False)
+    model.load_state_dict(state, strict=True, assign=True)
+
+
+def quantized(weight):
+    """Native quantizer and BF16 dequantization, as in fp8_linear_forward_patch."""
+    from musubi_tuner.modules.fp8_optimization_utils import quantize_weight
+
+    q, scale = quantize_weight("loraga.weight", weight.detach(), torch.float8_e4m3fn, 448.0, -448.0)
+    scale = scale.to(weight.dtype)
+    if scale.ndim == 3:
+        return (q.to(weight.dtype).reshape(scale.shape[0], scale.shape[1], -1) * scale).reshape(weight.shape)
+    return q.to(weight.dtype) * scale
+
+
+def output_probe(trainer, args, accelerator, model, inputs, targets, initial=None, fp8=False):
+    """One deterministic cached training batch, using actual target/control conditioning."""
+    from musubi_tuner.flux_2.flux2_models import FP8_OPTIMIZATION_TARGET_KEYS, FP8_OPTIMIZATION_EXCLUDE_KEYS
+
+    def transform(path, weight):
+        if any(key in path for key in FP8_OPTIMIZATION_TARGET_KEYS) and not any(
+            key in path for key in FP8_OPTIMIZATION_EXCLUDE_KEYS
+        ):
+            return quantized(weight)
+        return weight
+
+    additions = None
+    if initial:
+        scaling = float(args.network_alpha or args.network_dim) / args.network_dim
+        additions = {id(targets[name]): (a, b, scaling) for name, (a, b) in initial.items()}
+    batch, latents, noise, noisy, timesteps = send_to_device(inputs, accelerator.device)
+    model.eval()
+    with torch.no_grad(), streamed_linears(model, {}, None, accelerator.device,
+                                           weight_transform=transform if fp8 else None, additions=additions), accelerator.autocast():
+        output = trainer.call_dit(args, accelerator, model, latents, batch, noise, noisy, timesteps, torch.float32).pred
+    return output.detach().float().cpu()
 
 
 def initialize(trainer, args, accelerator, model):
@@ -265,6 +295,25 @@ def initialize(trainer, args, accelerator, model):
             raise ValueError(f"LoRA-GA rank too large for {lora.lora_name}")
     group, collator = trainer._loraga_dataset
     metadata = identity(args, group, targets)
+    # Same noise/timestep/input for all four representations; separate from estimation RNG.
+    from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+
+    with isolated_rng():
+        seed_rng(args.loraga_seed)
+        pool = trainer.timestep_range_pool
+        trainer.timestep_range_pool = []
+        try:
+            batch = group[0]
+            latents = trainer.scale_shift_latents(batch["latents"])
+            noise = torch.randn_like(latents)
+            scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
+            noisy, timesteps = trainer.get_noisy_model_input_and_timesteps(
+                args, noise, latents, batch["timesteps"], scheduler, torch.device("cpu"), torch.bfloat16)
+            inputs = (batch, latents, noise, noisy, timesteps)
+        finally:
+            trainer.timestep_range_pool = pool
+    baseline = output_probe(trainer, args, accelerator, model, inputs, targets)
+    ordinary = output_probe(trainer, args, accelerator, model, inputs, targets, fp8=True) if args.fp8_scaled else None
     source = Path(args.resume) / CACHE_NAME if args.resume else Path(
         args.loraga_init_cache or str(Path(args.output_dir) / CACHE_NAME))
     if source.exists():
@@ -274,8 +323,80 @@ def initialize(trainer, args, accelerator, model):
         initial, metrics = estimate(trainer, args, accelerator, model, network, targets, group, collator)
         save_cache(source, initial, metadata, metrics)
     scaling = float(args.network_alpha or args.network_dim) / args.network_dim
+    # Evaluate compensated BF16 before applying persistent native FP8 quantization.
     metrics.update(compensate(model, initial, targets, scaling, args.fp8_scaled, args.loraga_max_quantization_error_ratio))
+    restored = output_probe(trainer, args, accelerator, model, inputs, targets, initial)
+    metrics["loraga/initial_output_error"] = (restored - baseline).square().mean().sqrt().item()
+    metrics["loraga/initial_output_relative_error"] = metrics["loraga/initial_output_error"] / max(
+        baseline.square().mean().sqrt().item(), 1e-12)
+    if args.fp8_scaled:
+        fp8_output = output_probe(trainer, args, accelerator, model, inputs, targets, initial, fp8=True)
+        error = (fp8_output - baseline).square().mean().sqrt().item()
+        ordinary_error = (ordinary - baseline).square().mean().sqrt().item()
+        metrics.update({"loraga/quantization_error": error, "loraga/ordinary_fp8_output_error": ordinary_error,
+                        "loraga/output_error_ratio": error / max(ordinary_error, 1e-12)})
+        if metrics["loraga/output_error_ratio"] > args.loraga_max_quantization_error_ratio:
+            raise ValueError(f"LoRA-GA output error ratio {metrics['loraga/output_error_ratio']:.6g} exceeds configured limit "
+                             f"{args.loraga_max_quantization_error_ratio}; inspect initialization metrics before changing the limit")
+        quantize_model(model)
     trainer._loraga_initial, trainer._loraga_metadata, trainer._loraga_metrics = initial, metadata, metrics
     del trainer._loraga_dataset
     model.requires_grad_(False)
     return model
+
+
+def dataset_state(group):
+    """Persist shuffled descriptors, not cached tensors or dataset Python objects."""
+    return [{"epoch": dataset.current_epoch,
+             "buckets": [[list(key), [item.item_key for item in items]]
+                         for key, items in dataset.batch_manager.buckets.items()],
+             "indices": dataset.batch_manager.bucket_batch_indices,
+             "timesteps": dataset.batch_manager.timestep_pool}
+            for dataset in group.datasets]
+
+
+def restore_dataset(group, states):
+    if len(group.datasets) != len(states):
+        raise ValueError("LoRA-GA resume dataset count mismatch")
+    for dataset, state in zip(group.datasets, states):
+        manager = dataset.batch_manager
+        for key, names in state["buckets"]:
+            key = tuple(key)
+            items = {item.item_key: item for item in manager.buckets[key]}
+            if set(items) != set(names) or len(manager.buckets[key]) != len(names):
+                raise ValueError("LoRA-GA resume dataset items mismatch")
+            manager.buckets[key] = [items[name] for name in names]
+        manager.bucket_batch_indices = [(tuple(key), index) for key, index in state["indices"]]
+        manager.timestep_pool = state["timesteps"]
+        dataset.current_epoch = state["epoch"]
+
+
+def register_resume(trainer, args, accelerator, network):
+    """Accelerate keeps raw rank-r factors/optimizer/RNG; sidecar reconstructs base."""
+    signature_keys = ("seed", "gradient_accumulation_steps", "optimizer_type", "optimizer_args", "learning_rate",
+                      "lr_scheduler", "lr_scheduler_args", "lr_warmup_steps", "max_train_steps")
+    signature = {key: getattr(args, key, None) for key in signature_keys}
+
+    def save(models, weights, directory):
+        save_cache(Path(directory) / CACHE_NAME, trainer._loraga_initial, trainer._loraga_metadata,
+                   trainer._loraga_saved_metrics)
+        state = dict(trainer._loraga_progress)
+        state.update({"signature": signature, "timestep_pool": trainer.timestep_range_pool,
+                      "datasets": dataset_state(trainer._loraga_training_group)})
+        (Path(directory) / "loraga_progress.json").write_text(json.dumps(state), encoding="utf-8")
+
+    def load(models, directory):
+        # Validate before Accelerate mutates the raw network or optimizer.
+        initial, _ = load_cache(Path(directory) / CACHE_NAME, trainer._loraga_metadata)
+        if any(not torch.equal(tensor, other) for name, pair in initial.items()
+               for tensor, other in zip(pair, trainer._loraga_initial[name])):
+            raise ValueError("LoRA-GA resume initial factors differ from reconstructed backbone")
+        state = json.loads((Path(directory) / "loraga_progress.json").read_text(encoding="utf-8"))
+        if state["signature"] != signature:
+            raise ValueError("LoRA-GA resume optimizer/scheduler/batch configuration mismatch")
+        restore_dataset(trainer._loraga_training_group, state["datasets"])
+        trainer.timestep_range_pool = [tuple(value) for value in state["timestep_pool"]]
+        trainer._loraga_progress = {key: state[key] for key in ("global_step", "epoch", "next_batch")}
+
+    accelerator.register_save_state_pre_hook(save)
+    accelerator.register_load_state_pre_hook(load)
