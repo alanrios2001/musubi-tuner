@@ -43,6 +43,9 @@ class Flux2NetworkTrainer(NetworkTrainer):
         from musubi_tuner.training.flux2_validation import validate_validation_args
 
         validate_validation_args(args)
+        from musubi_tuner.training.flux2_loraga import validate_args
+
+        validate_args(args)
         self.model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
         self.dit_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
         self._i2v_training = False
@@ -52,6 +55,8 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
     def _build_dataset(self, args):
         result = super()._build_dataset(args)
+        if getattr(args, "loraga", False):
+            self._loraga_dataset = result[:2]
         if getattr(args, "validation_dataset_config", None):
             from musubi_tuner.training.flux2_validation import build_validation_loader
 
@@ -78,7 +83,11 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
     def extra_step_logs(self, args, logs):
         # Keep historical loss/current and loss/average intact.
-        return {"train/loss": logs["loss/current"]}
+        result = {"train/loss": logs["loss/current"]}
+        if getattr(self, "_loraga_metrics", None):
+            result.update(self._loraga_metrics)
+            self._loraga_metrics = None
+        return result
 
     def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
         device = accelerator.device
@@ -267,18 +276,35 @@ class Flux2NetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
+        loraga = getattr(args, "loraga", False)
         model = flux2_utils.load_flow_model(
             accelerator.device,
             model_version_info=self.model_version_info,
             dit_path=dit_path,
             attn_mode=attn_mode,
             split_attn=split_attn,
-            loading_device=loading_device,
-            dit_weight_dtype=dit_weight_dtype,
-            fp8_scaled=args.fp8_scaled,
+            loading_device="cpu" if loraga else loading_device,
+            dit_weight_dtype=torch.bfloat16 if loraga else dit_weight_dtype,
+            fp8_scaled=False if loraga else args.fp8_scaled,
             disable_numpy_memmap=args.disable_numpy_memmap,
         )
+        if loraga:
+            from musubi_tuner.training.flux2_loraga import initialize
+
+            model = initialize(self, args, accelerator, model)
         return model
+
+    def _build_network(self, args, accelerator, transformer, vae, weight_dtype):
+        network = super()._build_network(args, accelerator, transformer, vae, weight_dtype)
+        if getattr(args, "loraga", False):
+            with torch.no_grad():
+                for module in network.unet_loras:
+                    a, b = self._loraga_initial[module.lora_name]
+                    module.lora_down.weight.copy_(a)
+                    module.lora_up.weight.copy_(b)
+            # Plain CPU tensors: excluded from optimizer, accelerator state and device moves.
+            network.loraga_initial = self._loraga_initial
+        return network
 
     def compile_transformer(self, args, transformer):
         transformer: flux2_models.Flux2 = transformer
@@ -372,6 +398,9 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
 def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Flux.2-dev specific parser setup"""
+    from musubi_tuner.training.flux2_loraga import add_arguments
+
+    add_arguments(parser)
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
     parser.add_argument("--text_encoder", type=str, default=None, help="text encoder checkpoint path")
     parser.add_argument("--fp8_text_encoder", action="store_true", help="use fp8 for Text Encoder model")
