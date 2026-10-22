@@ -1472,6 +1472,9 @@ class NetworkTrainer:
         accelerator, weight_dtype, dit_dtype, dit_weight_dtype, vae_dtype = self._prepare_accelerator_and_dtypes(args)
         sample_parameters, sample_resources = self.prepare_sampling(args, accelerator, vae_dtype)
         transformer = self._load_dit_and_swap(args, accelerator, dit_weight_dtype)
+        if getattr(args, "loraga_init_only", False):
+            logger.info("LoRA-GA initialization cache complete; optimizer and training loop were not created")
+            return
         # the network factories take a LyCORIS-compatible vae argument; the sampling
         # resources fill it only when they are a plain module (single-VAE architectures)
         network_vae = sample_resources if isinstance(sample_resources, torch.nn.Module) else None
@@ -1671,7 +1674,7 @@ class NetworkTrainer:
         transformer.eval()
         transformer.requires_grad_(False)
 
-        if blocks_to_swap > 0:
+        if blocks_to_swap > 0 and not getattr(args, "loraga_init_only", False):
             swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
             logger.info(
                 f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, "
@@ -2060,6 +2063,10 @@ class NetworkTrainer:
         if getattr(args, "loraga", False):
             epoch_to_start = self._loraga_progress["epoch"]
             global_step = self._loraga_progress["global_step"]
+            if self._loraga_progress["next_batch"] >= len(train_dataloader):
+                epoch_to_start += 1
+            if global_step >= args.max_train_steps:
+                epoch_to_start = num_train_epochs
             progress_bar.update(global_step)
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
@@ -2174,10 +2181,10 @@ class NetworkTrainer:
             first_batch = 0
             if getattr(args, "loraga", False):
                 # Private generator recreates sampler order without consuming training RNG.
-                generator = torch.Generator().manual_seed((args.seed or args.loraga_seed) + epoch)
-                train_dataloader.generator = generator
+                generator = torch.Generator().manual_seed((args.seed if args.seed is not None else args.loraga_seed) + epoch)
+                train_dataloader.base_dataloader.generator = generator
                 train_dataloader.batch_sampler.sampler.generator = generator
-                first_batch = self._loraga_progress["next_batch"] if epoch == epoch_to_start else 0
+                first_batch = self._loraga_progress["next_batch"] if epoch == self._loraga_progress["epoch"] else 0
                 epoch_loader = accelerate.skip_first_batches(train_dataloader, first_batch) if first_batch else train_dataloader
 
             for step, batch in enumerate(epoch_loader, start=first_batch):

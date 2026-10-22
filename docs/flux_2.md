@@ -1,5 +1,7 @@
 # FLUX.2
 
+Optional Klein Base 4B gradient-based initialization: [LoRA-GA](./flux_2_loraga.md).
+
 ## Overview / 概要
 
 This document describes the usage of the [FLUX.2](https://huggingface.co/black-forest-labs/FLUX.2-dev) \[dev\] architecture within the Musubi Tuner framework. FLUX.2-dev is an image generation model and edit model that can take a reference image as input.

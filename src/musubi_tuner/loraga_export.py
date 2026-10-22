@@ -26,8 +26,14 @@ def export(weights, initialization, output):
         if float(state[f"{name}.alpha"]) != identity["alpha"]:
             raise ValueError(f"Raw adapter alpha differs from initialization: {name}")
     converted = converted_state_dict(state, initial)
-    metadata.update({"ss_network_module": "networks.lora_flux_2", "ss_network_dim": str(identity["rank"] * 2),
-                     "ss_network_alpha": str(identity["alpha"] * 2), "ss_loraga_export": "exact_difference_rank_2r"})
+    metadata.update(
+        {
+            "ss_network_module": "networks.lora_flux_2",
+            "ss_network_dim": str(identity["rank"] * 2),
+            "ss_network_alpha": str(identity["alpha"] * 2),
+            "ss_loraga_export": "exact_difference_rank_2r",
+        }
+    )
     save_file(converted, output, metadata=metadata)
 
 

@@ -72,13 +72,17 @@ def streamed_linears(model, targets, sink, device, weight_transform=None, additi
                 originals.append((module, module.forward))
                 name = target_names.get(id(module))
                 module.weight.requires_grad_(name is not None)
+
                 def forward(x, m=module, n=name, p=path):
                     weight = m.weight if weight_transform is None else weight_transform(p, m.weight)
                     output = _StreamLinear.apply(x, weight, m.bias, sink if n is not None else None, n)
                     if additions and id(m) in additions:
                         a, b, scale = additions[id(m)]
-                        output = output + F.linear(F.linear(x.to(output.dtype), a.to(x.device, output.dtype)),
-                                                   b.to(x.device, output.dtype)) * scale
+                        output = (
+                            output
+                            + F.linear(F.linear(x.to(output.dtype), a.to(x.device, output.dtype)), b.to(x.device, output.dtype))
+                            * scale
+                        )
                     return output
 
                 module.forward = forward

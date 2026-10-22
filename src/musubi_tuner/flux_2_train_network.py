@@ -279,6 +279,10 @@ class Flux2NetworkTrainer(NetworkTrainer):
         dit_weight_dtype: Optional[torch.dtype],
     ):
         loraga = getattr(args, "loraga", False)
+        if loraga:
+            from musubi_tuner.training.flux2_loraga import validate_checkpoint
+
+            validate_checkpoint(dit_path)
         model = flux2_utils.load_flow_model(
             accelerator.device,
             model_version_info=self.model_version_info,

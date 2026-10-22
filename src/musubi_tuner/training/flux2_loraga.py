@@ -32,14 +32,23 @@ def add_arguments(parser):
     parser.add_argument("--loraga_scale", choices=["stable", "unit", "gd"], default="stable")
     parser.add_argument("--loraga_stable_gamma", type=float, default=16.0)
     parser.add_argument("--loraga_init_cache", type=str, help="Initialization safetensors path; validate and reuse if present")
+    parser.add_argument(
+        "--loraga_init_only", action="store_true", help="Create/validate initialization cache and exit before optimizer setup"
+    )
     parser.add_argument("--loraga_work_dir", type=str, help="Temporary disk gradient storage (default: system temp)")
-    parser.add_argument("--loraga_max_quantization_error_ratio", type=float, default=2.0,
-                        help="Fail if aggregate compensated FP8 weight RMSE exceeds this multiple of ordinary FP8 RMSE")
+    parser.add_argument(
+        "--loraga_max_quantization_error_ratio",
+        type=float,
+        default=2.0,
+        help="Fail if aggregate compensated FP8 weight RMSE exceeds this multiple of ordinary FP8 RMSE",
+    )
 
 
 def validate_args(args):
     resume = Path(args.resume) if args.resume else None
     if not args.loraga:
+        if args.loraga_init_only:
+            raise ValueError("--loraga_init_only requires --loraga")
         if resume and (resume / CACHE_NAME).exists():
             raise ValueError("This state requires --loraga to reconstruct the compensated backbone")
         return
@@ -48,11 +57,15 @@ def validate_args(args):
     if args.network_module not in ("networks.lora_flux_2", "musubi_tuner.networks.lora_flux_2"):
         raise ValueError("LoRA-GA supports only networks.lora_flux_2 Linear adapters")
     if args.network_args or args.network_dropout or args.base_weights or args.network_weights or args.dim_from_weights:
-        raise ValueError("LoRA-GA does not support network_args/dropout/base_weights/network_weights/dim_from_weights; resume with --resume")
+        raise ValueError(
+            "LoRA-GA does not support network_args/dropout/base_weights/network_weights/dim_from_weights; resume with --resume"
+        )
     if args.fp8_base != args.fp8_scaled:
         raise ValueError("LoRA-GA FP8 requires both --fp8_base and --fp8_scaled (or neither for BF16)")
     if args.loraga_estimation_batches <= 0 or args.network_dim is None or args.network_dim <= 0:
         raise ValueError("LoRA-GA estimation_batches and network_dim must be positive")
+    if args.network_alpha is not None and (not math.isfinite(args.network_alpha) or args.network_alpha < 0):
+        raise ValueError("LoRA-GA network_alpha must be finite and nonnegative (0 uses rank)")
     if not math.isfinite(args.loraga_max_quantization_error_ratio) or args.loraga_max_quantization_error_ratio <= 0:
         raise ValueError("LoRA-GA quantization error ratio must be finite and positive")
     if not math.isfinite(args.loraga_stable_gamma) or args.loraga_stable_gamma <= 0:
@@ -73,6 +86,17 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+def validate_checkpoint(path):
+    from musubi_tuner.utils.safetensors_utils import get_split_weight_filenames
+
+    for filename in get_split_weight_filenames(path) or [path]:
+        with safe_open(filename, framework="pt", device="cpu") as file:
+            for key in file.keys():
+                dtype = file.get_slice(key).get_dtype()
+                if dtype.startswith("F8") or "scale_weight" in key:
+                    raise ValueError(f"LoRA-GA requires original unquantized BF16/FP32 weights; found {dtype}: {key}")
+
+
 def identity(args, group, targets):
     from musubi_tuner.utils.safetensors_utils import get_split_weight_filenames
 
@@ -84,21 +108,30 @@ def identity(args, group, targets):
                     if path is None:
                         raise ValueError("LoRA-GA requires cached latent and text conditioning files")
                     caches.add(str(Path(path).resolve()))
-    objective_keys = [key for key in vars(args) if any(
-        token in key for token in ("timestep", "weighting", "flow_shift", "logit", "mode_scale", "sigmoid", "logsnr")
-    )]
+    objective_keys = [
+        key
+        for key in vars(args)
+        if any(token in key for token in ("timestep", "weighting", "flow_shift", "logit", "mode_scale", "sigmoid", "logsnr"))
+    ]
     return {
         "version": 1,
+        "torch_version": torch.__version__,
+        "fp8_quantization": {"mode": "block", "block_size": 64, "format": "e4m3fn"},
         "checkpoint": [[str(Path(p).resolve()), file_hash(p)] for p in (get_split_weight_filenames(args.dit) or [args.dit])],
         "dataset_config": file_hash(args.dataset_config),
         "caches": [[p, file_hash(p)] for p in sorted(caches)],
         "model": args.model_version,
         "rank": args.network_dim,
         "alpha": float(args.network_alpha or args.network_dim),
-        "direction": args.loraga_direction, "scale": args.loraga_scale, "gamma": args.loraga_stable_gamma,
-        "seed": args.loraga_seed, "batches": args.loraga_estimation_batches,
+        "direction": args.loraga_direction,
+        "scale": args.loraga_scale,
+        "gamma": args.loraga_stable_gamma,
+        "seed": args.loraga_seed,
+        "batches": args.loraga_estimation_batches,
         "objective": {key: getattr(args, key) for key in objective_keys},
-        "fp8_base": args.fp8_base, "fp8_scaled": args.fp8_scaled,
+        "fp8_base": args.fp8_base,
+        "fp8_scaled": args.fp8_scaled,
+        "attention": {key: getattr(args, key, None) for key in ("sdpa", "flash_attn", "flash3", "xformers", "split_attn")},
         "targets": {name: list(module.weight.shape) for name, module in targets.items()},
     }
 
@@ -114,7 +147,9 @@ def save_cache(path, initial, metadata, metrics):
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".safetensors", delete=False) as stream:
         temporary = Path(stream.name)
     try:
-        save_file(tensors, str(temporary), metadata={"identity": json.dumps(metadata, sort_keys=True), "metrics": json.dumps(metrics)})
+        save_file(
+            tensors, str(temporary), metadata={"identity": json.dumps(metadata, sort_keys=True), "metrics": json.dumps(metrics)}
+        )
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -126,6 +161,9 @@ def load_cache(path, expected):
     if json.loads(metadata.get("identity", "null")) != expected:
         raise ValueError(f"Incompatible LoRA-GA initialization cache: {path}")
     state = load_file(str(path))
+    keys = {f"{name}.{suffix}" for name in expected["targets"] for suffix in ("a", "b")}
+    if set(state) != keys:
+        raise ValueError("Missing or unexpected tensors in LoRA-GA initialization cache")
     initial = {}
     for name, (out_dim, in_dim) in expected["targets"].items():
         a, b = state.pop(f"{name}.a"), state.pop(f"{name}.b")
@@ -143,8 +181,14 @@ def estimate(trainer, args, accelerator, model, network, targets, group, collato
     from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 
     # Match the training loader's native batches, including repeats and paired controls.
-    loader = torch.utils.data.DataLoader(group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=0,
-                                        generator=torch.Generator().manual_seed(args.loraga_seed))
+    loader = torch.utils.data.DataLoader(
+        group,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=0,
+        generator=torch.Generator().manual_seed(args.loraga_seed),
+    )
     scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
     started = time.perf_counter()
     pool = trainer.timestep_range_pool
@@ -178,8 +222,20 @@ def estimate(trainer, args, accelerator, model, network, targets, group, collato
                     latents = trainer.scale_shift_latents(batch["latents"])
                     noise = torch.randn_like(latents)
                     with accelerator.autocast():
-                        loss, _ = trainer.process_batch(args, accelerator, model, network, batch, latents, noise,
-                                                       scheduler, torch.bfloat16, torch.float32, None, 0)
+                        loss, _ = trainer.process_batch(
+                            args,
+                            accelerator,
+                            model,
+                            network,
+                            batch,
+                            latents,
+                            noise,
+                            scheduler,
+                            torch.bfloat16,
+                            torch.float32,
+                            None,
+                            0,
+                        )
                     if not torch.isfinite(loss):
                         raise ValueError("Nonfinite LoRA-GA estimation loss")
                     loss.backward()
@@ -187,13 +243,16 @@ def estimate(trainer, args, accelerator, model, network, targets, group, collato
                     logger.info("LoRA-GA gradient batch %s/%s", index + 1, args.loraga_estimation_batches)
             for lora in network.unet_loras:
                 gradient = sink.take(lora.lora_name, args.loraga_estimation_batches)
-                initial[lora.lora_name] = initialize_factors(gradient, lora.lora_dim, lora.scale,
-                                                           args.loraga_direction, args.loraga_scale, args.loraga_stable_gamma)
+                initial[lora.lora_name] = initialize_factors(
+                    gradient, lora.lora_dim, lora.scale, args.loraga_direction, args.loraga_scale, args.loraga_stable_gamma
+                )
                 del gradient
     except (torch.OutOfMemoryError, MemoryError) as error:
-        raise RuntimeError("LoRA-GA BF16 initialization exhausted memory. Requires CPU backbone + offloaded activations, "
-                           "one FP32 gradient/SVD workspace in RAM and one Linear/attention operation in VRAM. "
-                           "Reduce cached resolution/batch size; no alternate initialization was used.") from error
+        raise RuntimeError(
+            "LoRA-GA BF16 initialization exhausted memory. Requires CPU backbone + offloaded activations, "
+            "one FP32 gradient/SVD workspace in RAM and one Linear/attention operation in VRAM. "
+            "Reduce cached resolution/batch size; no alternate initialization was used."
+        ) from error
     finally:
         trainer.timestep_range_pool = pool
         model.disable_gradient_checkpointing()
@@ -201,8 +260,10 @@ def estimate(trainer, args, accelerator, model, network, targets, group, collato
         gc.collect()
         if accelerator.device.type == "cuda":
             torch.cuda.empty_cache()
-    metrics = {"loraga/initialization_seconds": time.perf_counter() - started,
-               "loraga/estimated_batches": args.loraga_estimation_batches}
+    metrics = {
+        "loraga/initialization_seconds": time.perf_counter() - started,
+        "loraga/estimated_batches": args.loraga_estimation_batches,
+    }
     if accelerator.device.type == "cuda":
         metrics["loraga/initialization_peak_vram_bytes"] = torch.cuda.max_memory_allocated(accelerator.device)
     return initial, metrics
@@ -218,6 +279,8 @@ def compensate(model, initial, targets, scaling, fp8, max_ratio):
         original = module.weight.detach().float()
         offset = (b @ a) * scaling
         residual = (original - offset).to(torch.bfloat16)
+        if not torch.isfinite(residual).all():
+            raise ValueError(f"LoRA-GA compensation overflow: {name}")
         sums[0] += (residual.float() + offset - original).square().sum().item()
         if fp8:
             sums[1] += (quantized(module.weight.detach()).float() - original).square().sum().item()
@@ -227,12 +290,18 @@ def compensate(model, initial, targets, scaling, fp8, max_ratio):
     metrics = {"loraga/compensation_weight_rmse": math.sqrt(sums[0] / count)}
     if fp8:
         ratio = math.sqrt(sums[2] / max(sums[1], 1e-30))
-        metrics.update({"loraga/ordinary_fp8_weight_rmse": math.sqrt(sums[1] / count),
-                        "loraga/compensated_fp8_weight_rmse": math.sqrt(sums[2] / count),
-                        "loraga/quantization_error_ratio": ratio})
+        metrics.update(
+            {
+                "loraga/ordinary_fp8_weight_rmse": math.sqrt(sums[1] / count),
+                "loraga/compensated_fp8_weight_rmse": math.sqrt(sums[2] / count),
+                "loraga/quantization_error_ratio": ratio,
+            }
+        )
         if ratio > max_ratio:
-            raise ValueError(f"LoRA-GA FP8 weight RMSE ratio {ratio:.6g} exceeds configured limit {max_ratio}; "
-                             "initialization cache remains reusable. Inspect scaling before explicitly changing the limit.")
+            raise ValueError(
+                f"LoRA-GA FP8 weight RMSE ratio {ratio:.6g} exceeds configured limit {max_ratio}; "
+                "initialization cache remains reusable. Inspect scaling before explicitly changing the limit."
+            )
     logger.info("LoRA-GA initialization metrics: %s", metrics)
     return metrics
 
@@ -275,13 +344,20 @@ def output_probe(trainer, args, accelerator, model, inputs, targets, initial=Non
         additions = {id(targets[name]): (a, b, scaling) for name, (a, b) in initial.items()}
     batch, latents, noise, noisy, timesteps = send_to_device(inputs, accelerator.device)
     model.eval()
-    with torch.no_grad(), streamed_linears(model, {}, None, accelerator.device,
-                                           weight_transform=transform if fp8 else None, additions=additions), accelerator.autocast():
+    with (
+        torch.no_grad(),
+        streamed_linears(model, {}, None, accelerator.device, weight_transform=transform if fp8 else None, additions=additions),
+        accelerator.autocast(),
+    ):
         output = trainer.call_dit(args, accelerator, model, latents, batch, noise, noisy, timesteps, torch.float32).pred
-    return output.detach().float().cpu()
+    output = output.detach().float().cpu()
+    if not torch.isfinite(output).all():
+        raise ValueError("LoRA-GA output probe produced nonfinite values")
+    return output
 
 
 def initialize(trainer, args, accelerator, model):
+    started = time.perf_counter()
     if accelerator.num_processes != 1:
         raise ValueError("LoRA-GA initialization currently supports one process only")
     network = lora_flux_2.create_arch_network(1.0, args.network_dim, args.network_alpha, None, None, model)
@@ -308,14 +384,17 @@ def initialize(trainer, args, accelerator, model):
             noise = torch.randn_like(latents)
             scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
             noisy, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                args, noise, latents, batch["timesteps"], scheduler, torch.device("cpu"), torch.bfloat16)
+                args, noise, latents, batch["timesteps"], scheduler, torch.device("cpu"), torch.bfloat16
+            )
             inputs = (batch, latents, noise, noisy, timesteps)
         finally:
             trainer.timestep_range_pool = pool
     baseline = output_probe(trainer, args, accelerator, model, inputs, targets)
     ordinary = output_probe(trainer, args, accelerator, model, inputs, targets, fp8=True) if args.fp8_scaled else None
-    source = Path(args.resume) / CACHE_NAME if args.resume else Path(
-        args.loraga_init_cache or str(Path(args.output_dir) / CACHE_NAME))
+    source = (
+        Path(args.resume) / CACHE_NAME if args.resume else Path(args.loraga_init_cache or str(Path(args.output_dir) / CACHE_NAME))
+    )
+    reused = source.exists()
     if source.exists():
         initial, metrics = load_cache(source, metadata)
         logger.info("Reusing LoRA-GA initialization: %s", source)
@@ -328,31 +407,50 @@ def initialize(trainer, args, accelerator, model):
     restored = output_probe(trainer, args, accelerator, model, inputs, targets, initial)
     metrics["loraga/initial_output_error"] = (restored - baseline).square().mean().sqrt().item()
     metrics["loraga/initial_output_relative_error"] = metrics["loraga/initial_output_error"] / max(
-        baseline.square().mean().sqrt().item(), 1e-12)
+        baseline.square().mean().sqrt().item(), 1e-12
+    )
     if args.fp8_scaled:
         fp8_output = output_probe(trainer, args, accelerator, model, inputs, targets, initial, fp8=True)
         error = (fp8_output - baseline).square().mean().sqrt().item()
         ordinary_error = (ordinary - baseline).square().mean().sqrt().item()
-        metrics.update({"loraga/quantization_error": error, "loraga/ordinary_fp8_output_error": ordinary_error,
-                        "loraga/output_error_ratio": error / max(ordinary_error, 1e-12)})
+        metrics.update(
+            {
+                "loraga/quantization_error": error,
+                "loraga/ordinary_fp8_output_error": ordinary_error,
+                "loraga/output_error_ratio": error / max(ordinary_error, 1e-12),
+            }
+        )
         if metrics["loraga/output_error_ratio"] > args.loraga_max_quantization_error_ratio:
-            raise ValueError(f"LoRA-GA output error ratio {metrics['loraga/output_error_ratio']:.6g} exceeds configured limit "
-                             f"{args.loraga_max_quantization_error_ratio}; inspect initialization metrics before changing the limit")
-        quantize_model(model)
+            raise ValueError(
+                f"LoRA-GA output error ratio {metrics['loraga/output_error_ratio']:.6g} exceeds configured limit "
+                f"{args.loraga_max_quantization_error_ratio}; inspect initialization metrics before changing the limit"
+            )
+        if not args.loraga_init_only:
+            quantize_model(model)
+    metrics["loraga/estimation_seconds"] = metrics.get("loraga/estimation_seconds", metrics["loraga/initialization_seconds"])
+    metrics["loraga/initialization_seconds"] = time.perf_counter() - started
+    metrics["loraga/cache_reused"] = int(reused)
     trainer._loraga_initial, trainer._loraga_metadata, trainer._loraga_metrics = initial, metadata, metrics
     del trainer._loraga_dataset
     model.requires_grad_(False)
+    logger.info("LoRA-GA completed: %s", metrics)
+    gc.collect()
+    if accelerator.device.type == "cuda":
+        torch.cuda.empty_cache()
     return model
 
 
 def dataset_state(group):
     """Persist shuffled descriptors, not cached tensors or dataset Python objects."""
-    return [{"epoch": dataset.current_epoch,
-             "buckets": [[list(key), [item.item_key for item in items]]
-                         for key, items in dataset.batch_manager.buckets.items()],
-             "indices": dataset.batch_manager.bucket_batch_indices,
-             "timesteps": dataset.batch_manager.timestep_pool}
-            for dataset in group.datasets]
+    return [
+        {
+            "epoch": dataset.current_epoch,
+            "buckets": [[list(key), [item.item_key for item in items]] for key, items in dataset.batch_manager.buckets.items()],
+            "indices": dataset.batch_manager.bucket_batch_indices,
+            "timesteps": dataset.batch_manager.timestep_pool,
+        }
+        for dataset in group.datasets
+    ]
 
 
 def restore_dataset(group, states):
@@ -373,23 +471,51 @@ def restore_dataset(group, states):
 
 def register_resume(trainer, args, accelerator, network):
     """Accelerate keeps raw rank-r factors/optimizer/RNG; sidecar reconstructs base."""
-    signature_keys = ("seed", "gradient_accumulation_steps", "optimizer_type", "optimizer_args", "learning_rate",
-                      "lr_scheduler", "lr_scheduler_args", "lr_warmup_steps", "max_train_steps")
+    signature_keys = (
+        "seed",
+        "gradient_accumulation_steps",
+        "optimizer_type",
+        "optimizer_args",
+        "learning_rate",
+        "lr_scheduler",
+        "lr_scheduler_args",
+        "lr_warmup_steps",
+        "max_train_steps",
+        "max_grad_norm",
+        "scale_weight_norms",
+        "gradient_checkpointing",
+        "gradient_checkpointing_cpu_offload",
+        "compile",
+        "compile_backend",
+        "compile_mode",
+        "compile_dynamic",
+        "compile_fullgraph",
+        "blocks_to_swap",
+        "block_swap_h2d_only",
+        "block_swap_ring_size",
+    )
     signature = {key: getattr(args, key, None) for key in signature_keys}
 
     def save(models, weights, directory):
-        save_cache(Path(directory) / CACHE_NAME, trainer._loraga_initial, trainer._loraga_metadata,
-                   trainer._loraga_saved_metrics)
+        save_cache(Path(directory) / CACHE_NAME, trainer._loraga_initial, trainer._loraga_metadata, trainer._loraga_saved_metrics)
         state = dict(trainer._loraga_progress)
-        state.update({"signature": signature, "timestep_pool": trainer.timestep_range_pool,
-                      "datasets": dataset_state(trainer._loraga_training_group)})
+        state.update(
+            {
+                "signature": signature,
+                "timestep_pool": trainer.timestep_range_pool,
+                "datasets": dataset_state(trainer._loraga_training_group),
+            }
+        )
         (Path(directory) / "loraga_progress.json").write_text(json.dumps(state), encoding="utf-8")
 
     def load(models, directory):
         # Validate before Accelerate mutates the raw network or optimizer.
         initial, _ = load_cache(Path(directory) / CACHE_NAME, trainer._loraga_metadata)
-        if any(not torch.equal(tensor, other) for name, pair in initial.items()
-               for tensor, other in zip(pair, trainer._loraga_initial[name])):
+        if any(
+            not torch.equal(tensor, other)
+            for name, pair in initial.items()
+            for tensor, other in zip(pair, trainer._loraga_initial[name])
+        ):
             raise ValueError("LoRA-GA resume initial factors differ from reconstructed backbone")
         state = json.loads((Path(directory) / "loraga_progress.json").read_text(encoding="utf-8"))
         if state["signature"] != signature:
