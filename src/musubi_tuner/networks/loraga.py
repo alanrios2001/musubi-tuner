@@ -9,13 +9,13 @@ import math
 import torch
 
 
-def initialize_factors(gradient, rank, scaling, direction="ArB2r", scale="stable", gamma=16.0):
+def initialize_factors(gradient, rank, scaling, direction="ArB2r", scale="stable", gamma=16.0, device="cpu"):
     """Return A [rank,in], B [out,rank], using the reference randomized SVD."""
     if gradient.ndim != 2 or rank <= 0 or 2 * rank > min(gradient.shape):
         raise ValueError("LoRA-GA requires a matrix with min(in,out) >= 2 * rank")
     if not math.isfinite(scaling) or scaling <= 0 or not math.isfinite(gamma) or gamma <= 0:
         raise ValueError("LoRA-GA scaling and stable_gamma must be finite and positive")
-    gradient = gradient.detach().to(device="cpu", dtype=torch.float32)
+    gradient = gradient.detach().to(device=device, dtype=torch.float32)
     if not torch.isfinite(gradient).all() or not gradient.count_nonzero():
         raise ValueError("LoRA-GA gradient must be finite and nonzero")
     u, _, v = torch.svd_lowrank(gradient, q=min(4 * rank, min(gradient.shape)), niter=4)
@@ -35,7 +35,7 @@ def initialize_factors(gradient, rank, scaling, direction="ArB2r", scale="stable
         factor = 1.0
     else:
         raise ValueError(f"Unsupported LoRA-GA scale: {scale}")
-    return (a * factor).contiguous(), (b * factor).contiguous()
+    return (a * factor).to("cpu").contiguous(), (b * factor).to("cpu").contiguous()
 
 
 def converted_state_dict(state, initial):

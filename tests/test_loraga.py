@@ -376,6 +376,10 @@ def test_two_stage_native_cached_objective_and_reuse(tmp_path, monkeypatch):
         raise AssertionError("Cache reuse repeated gradient estimation")
 
     monkeypatch.setattr("musubi_tuner.training.flux2_loraga.estimate", forbidden)
+    # Storage and SVD execution choices must not invalidate completed initialization factors.
+    args.loraga_gradient_ram_gb = 0
+    args.loraga_gpu_cache_gb = 0
+    args.loraga_svd_device = "cpu"
     initialize(trainer, args, accelerator, second)
     for key, value in initialized.state_dict().items():
         other = second.state_dict()[key]

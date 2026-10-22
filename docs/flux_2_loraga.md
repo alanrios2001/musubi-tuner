@@ -9,13 +9,14 @@ Source ownership:
 | File | Responsibility |
 | --- | --- |
 | `networks/loraga.py` | Reference factor construction and exact conversion |
-| `training/loraga_streaming.py` | Initialization-only autograd, CPU offload, disk gradients |
+| `training/loraga_streaming.py` | Initialization-only autograd, bounded RAM/CUDA gradient storage, weight cache and disk spill |
 | `training/flux2_loraga.py` | CLI validation, estimation, probes, compensation, native FP8, cache/resume metadata |
 | `flux_2_train_network.py` | FLUX.2 lifecycle integration and TensorBoard metrics |
 | `training/trainer_base.py` | Optional initialization-only exit and resume cursor/loader handling |
 | `networks/lora.py` | Optional automatic inference export when initial factors are attached |
 | `loraga_export.py` | Manual conversion of raw training-state adapters |
 | `tests/test_loraga.py` | Focused CPU/CUDA and full-loop synthetic tests |
+| `tests/test_loraga_performance.py` | Storage/caching parity, BF16 tensor-core gradients and CUDA SVD subspaces |
 
 Python paths above are under `src/musubi_tuner`, except tests. This document and
 the link in `docs/flux_2.md` cover usage and limitations.
@@ -34,13 +35,19 @@ three-batch gradient accumulation. No GaLore or reduced-rank approximation is us
    gradient estimation. Estimation batches do not advance optimizer steps or epochs.
 3. Temporarily mark target weights as requiring gradients. Initialization uses its
    own autograd Linear: CPU BF16 weights are copied for each forward/backward
-   operation. Saved activations go to CPU. FP32 weight gradients are immediately
-   accumulated to one disk file per module; no backbone optimizer exists.
-   All blocks use gradient checkpointing during this phase.
-4. Process each average gradient separately with CPU FP32 `torch.svd_lowrank`,
+   operation unless retained in the initialization weight cache. Saved activations
+   go to pinned CPU memory during CUDA estimation, allowing asynchronous retrieval
+   for backward. FP32 weight gradients accumulate in bounded RAM; excess gradients
+   spill to disk. After the first batch measures actual working VRAM, disk-spilled
+   gradients are promoted to spare CUDA memory first, and remaining space caches
+   immutable BF16 weights across forward, recomputation, and backward. No backbone
+   optimizer exists. All blocks use gradient checkpointing during this phase.
+4. Process each average gradient separately with FP32 `torch.svd_lowrank`,
    `q=min(4*r,min(shape))`, four power iterations. Default `ArB2r` uses
    `B=U[:,r:2r]`, `A=V[:,:r].T`. `stable` multiplies both factors by
    `out_features**0.25 / sqrt(gamma)`, with upstream gamma default 16.
+   SVD runs on CUDA by default when its estimated workspace fits, otherwise CPU.
+   Factors return to CPU after each SVD; full backbone gradients never reside in VRAM.
 5. Save FP32 initial factors and compatibility metadata. Compensate each CPU
    backbone matrix: `Wc = BF16(FP32(W) - (alpha/r)*(B0@A0))`.
 6. Measure deterministic cached-batch output and weight errors. Then use Musubi's
@@ -54,9 +61,15 @@ floating-point function equality; the underlying FP32 algebra is preserved.
 
 The initialization streamer is deliberately separate from Musubi's frozen-weight
 H2D-only ring buffers. It transfers weights during backward and supports actual
-backbone-weight gradients. Disk I/O and repeated H2D transfers make initialization
-substantially slower than ordinary LoRA steps. Ordinary training retains its
+backbone-weight gradients. Bounded RAM/CUDA accumulation avoids repeated disk I/O
+where memory permits, and retained weights reduce H2D traffic. Ordinary training retains its
 existing kernels, optimizer, checkpointing, and swap machinery.
+
+For BF16 operands only, the initialization weight-gradient GEMM may use TF32 tensor
+cores with FP32 accumulation: TF32 represents every BF16 input value without further
+operand truncation. The global matmul flag is restored immediately afterwards;
+CPU/FP32-input gradient calculations and SVD precision are unchanged. See the
+[PyTorch precision documentation](https://github.com/pytorch/pytorch/blob/v2.6.0/docs/source/notes/cuda.rst#tensorfloat-32-tf32-on-ampere-and-later-devices).
 
 ## Arguments
 
@@ -70,13 +83,23 @@ existing kernels, optimizer, checkpointing, and swap machinery.
 | `--loraga_stable_gamma` | `16`; positive finite value |
 | `--loraga_init_cache` | Safetensors filename; default `<output_dir>/loraga_init.safetensors` |
 | `--loraga_init_only` | Create/reuse and validate initialization, then exit before optimizer setup |
-| `--loraga_work_dir` | Disk gradient workspace; default system temporary directory |
+| `--loraga_work_dir` | Disk gradient spill workspace; default system temporary directory |
+| `--loraga_gradient_ram_gb` | `-1`: automatic RAM budget leaving 3 GiB free; `0`: no RAM accumulation; positive values set GiB |
+| `--loraga_gpu_cache_gb` | `-1`: spare VRAM measured after first backward; `0`: disable CUDA gradient/weight residency; positive values cap GiB |
+| `--loraga_gpu_reserve_gb` | `1`: VRAM margin, in addition to measured transient working memory plus 25% growth room |
+| `--loraga_svd_device` | `auto`: CUDA when estimated workspace fits; also explicit `cpu` or `cuda` |
 | `--loraga_max_quantization_error_ratio` | `2.0`; fail if aggregate weight or probe-output RMSE exceeds this multiple of ordinary FP8 RMSE |
 
 Other upstream direction/scale choices (`random`, `weightS`) and norm clipping are
 not exposed. Network kwargs, split adapters, dropout, other network types,
 `--network_weights`, `--dim_from_weights`, and merged `--base_weights` are rejected.
 Alpha 0/None follows Musubi's existing convention: alpha equals rank.
+
+To reproduce the old storage/device strategy, use `--loraga_gradient_ram_gb 0
+--loraga_gpu_cache_gb 0 --loraga_svd_device cpu`. The execution options above do not
+invalidate a completed initialization cache. Fresh CPU and CUDA randomized SVDs
+can choose different signs/random bases and differ in floating-point rounding;
+they use the same reference algorithm and are not promised bit-for-bit identical.
 
 ## Windows PowerShell
 
@@ -109,7 +132,9 @@ $gaArgs = @(
     '--loraga_seed', '42', '--loraga_direction', 'ArB2r',
     '--loraga_scale', 'stable', '--loraga_stable_gamma', '16',
     '--loraga_init_cache', 'D:\runs\klein-ga\init.safetensors',
-    '--loraga_work_dir', 'D:\loraga-work'
+    '--loraga_work_dir', 'D:\loraga-work',
+    '--loraga_gradient_ram_gb', '-1', '--loraga_gpu_cache_gb', '-1',
+    '--loraga_gpu_reserve_gb', '1', '--loraga_svd_device', 'auto'
 )
 
 # Standalone initialization; no optimizer or training steps.
@@ -225,8 +250,12 @@ training batch. Initialization-only runs print metrics to the console. Metrics
 include initialization and estimation/SVD time, estimated batches, cache reuse,
 peak estimation VRAM, BF16 output RMSE/relative RMSE, ordinary/compensated FP8
 output RMSE, weight RMSE, and both FP8 error ratios. Training loss tags are preserved.
+Additional performance metrics separate gradient collection and SVD time, report
+RAM/CUDA cache budgets and weight-cache hits, and count gradient payload bytes
+read/written to disk. Each gradient batch and each matrix SVD logs its duration.
 
-Synthetic fixture measurements on Windows, RTX 3070 Ti, Torch 2.6.0+cu124, BF16,
+Historical synthetic fixture measurements before RAM/CUDA caching, on Windows,
+RTX 3070 Ti, Torch 2.6.0+cu124, BF16,
 two estimated batches, rank/alpha 2/2, hidden size 32, two double/two single blocks:
 
 | Measurement | Observed |
@@ -246,10 +275,32 @@ two estimated batches, rank/alpha 2/2, hidden size 32, two double/two single blo
 These are fixture results, not evidence of LoRA-GA improving Klein training.
 Four-step synthetic swap tests had constant allocated VRAM after warmup:
 17,414,656 bytes with ordinary swapping and 17,445,376 bytes with H2D-only swapping.
-CUDA context/driver/reserved memory is additional. Full-sized Klein checkpoint,
-VAE decoding, and generated-image consistency were not tested: the required local
-Base 4B checkpoint and usable cached dataset were not supplied. GPU tests exercise
-real FLUX.2 modules at reduced geometry, not a pretrained 4B model.
+CUDA context/driver/reserved memory is additional. The full-size pretrained Base 4B
+checkpoint and native paired caches subsequently became available: real-model
+gradient collection and all 80 SVDs were tested with three batches, rank/alpha
+64/64, the existing 768px dataset configuration, and the actual flow-matching loss.
+The optimized phase completed in 48.35 seconds (40.24 seconds collecting gradients,
+7.88 seconds for SVD). Batch times were 23.39, 6.85, and 6.27 seconds. It used
+12.21 GiB of CPU gradient capacity, 1.51 GiB of CUDA gradients, 2.74 GiB of immutable
+CUDA weights, and peaked at 5.14 GiB of PyTorch-allocated VRAM. Driver, display,
+and allocator-reserved memory are additional. Only 1.51 GiB was written and read
+once for initial spill promotion; repeated accumulation used RAM/CUDA.
+
+With pinned activation retrieval enabled, another three-batch run completed in
+34.00 seconds (25.85 seconds collecting gradients, 7.95 seconds for SVD), with
+batch times 12.18, 6.52, and 6.23 seconds and 4.99 GiB peak allocated VRAM. That run
+had more free RAM: its auto plan used 13.24 GiB CPU gradients, 0.53 GiB CUDA
+gradients and 3.73 GiB CUDA weights. These auto-budget measurements are not a
+controlled attribution of the difference to pinned transfers alone.
+
+The same checkpoint/data/settings with disk accumulation and CPU SVD took 128.17
+seconds for its first batch alone. These are initialization performance results,
+not convergence or visual-quality comparisons. The disk-only benchmark was stopped
+after that measured first batch to avoid further expensive I/O; no full baseline
+three-batch speed ratio is claimed. Full 64-batch initialization,
+full-size compensated FP8 optimization/export, VAE decoding, and generated-image
+consistency remain unmeasured. Synthetic tests still cover those lifecycle
+integrations at reduced geometry.
 
 ## Memory and storage
 
@@ -259,24 +310,33 @@ Model-shape accounting for Klein Base 4B at rank 64 / alpha 64:
 | --- | --- |
 | Backbone | 3,875,544,576 parameters; approximately 7.22 GiB in CPU BF16 |
 | Target weights | 3,680,501,760 parameters in 80 modules |
-| Disk gradient accumulators | Approximately 13.71 GiB FP32, plus temporary file headroom |
+| Gradient accumulators | Approximately 13.71 GiB FP32, distributed over bounded RAM/CUDA and disk spill |
 | Initial adapter factors | 92,405,760 FP32 parameters; approximately 352.5 MiB |
 | Largest target gradient | 84,934,656 FP32 values; approximately 324 MiB |
 
 CPU RAM additionally holds saved activations, a current accumulator, SVD workspace,
 and temporary compensation/quantization matrices. Native CPU quantization can
 temporarily retain BF16 and FP8 model storage together. Disk free space is checked
-before estimation; reserve at least 16 GiB for gradients, plus cache/state/output
-files. A fast SSD is recommended. No fixed system-RAM or 8GB-VRAM fit is promised:
+before estimation for the amount exceeding the RAM budget. With RAM accumulation
+disabled, reserve at least 16 GiB for gradients, plus cache/state/output files.
+CUDA spill promotion can eliminate repeated disk reads/writes after the first
+batch, but the initial spill still needs space. A fast SSD is recommended.
+No universal system-RAM or 8GB-VRAM fit is promised:
 resolution, batch size, attention implementation, other applications, and paging
 all matter. Initialization reports resource exhaustion rather than changing the
-mathematical procedure. Full-sized peak VRAM remains unmeasured.
+mathematical procedure. The measured three-batch full-size VRAM result is reported
+above; it does not prove the maximum of every bucket or other running applications.
+If another bucket exceeds the measured headroom, lower `--loraga_gpu_cache_gb` or
+increase `--loraga_gpu_reserve_gb`. For host-memory pressure, lower
+`--loraga_gradient_ram_gb`. A running Python process keeps the old implementation
+until restarted; changing source files does not patch an active initialization.
 
 ## Tests and comparison protocol
 
 ```powershell
-& $python -m pytest tests/test_loraga.py tests/test_flux2_validation.py `
-    tests/test_lora_dtype_bridging.py tests/test_save_precision.py -q
+& $python -m pytest tests/test_loraga.py tests/test_loraga_performance.py `
+    tests/test_flux2_validation.py tests/test_lora_dtype_bridging.py `
+    tests/test_save_precision.py tests/test_top_level_entrypoints.py -q
 ```
 
 Coverage includes upstream factor formulas and gradient averaging, CPU/CUDA
@@ -288,11 +348,17 @@ AdamW8bit accumulated-gradient resume, gradient checkpointing, ordinary and
 H2D-only block swapping, stable allocations after warmup, and compilation with the
 `eager` backend. Inductor and full-sized image-quality tests remain unmeasured.
 
-Recorded results: **30 LoRA-GA tests and 42 focused existing regression tests
-passed** (validation, dtype bridging, save precision, and top-level entry points).
+Recorded results: **81 tests passed**: 30 LoRA-GA lifecycle tests, 9 performance/
+storage correctness tests, and 42 focused existing regression tests (validation,
+dtype bridging, save precision, and top-level entry points).
 The full-loop resume test also covers epoch-boundary and already-completed states.
 Ruff and `git diff --check` passed. Existing block-swapping pin-memory deprecation
 warnings were observed; no new test failures remain.
+
+The supplied `D:\repos\train.ps1` now calls the training entry point once: it
+initializes when no compatible cache exists and then trains in the same process.
+An additional initialization-only invocation is unnecessary for that workflow;
+the standalone initialization command above remains available when explicitly needed.
 
 For a controlled comparison, run the PowerShell `$trainArgs` command twice with
 separate output/log directories: first without `$gaArgs`, then with it. Pin the

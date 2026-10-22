@@ -18,7 +18,7 @@ from safetensors.torch import load_file, save_file
 from musubi_tuner.networks import lora_flux_2
 from musubi_tuner.networks.loraga import initialize_factors
 from musubi_tuner.training.flux2_validation import isolated_rng, seed_rng
-from musubi_tuner.training.loraga_streaming import DiskGradients, streamed_linears
+from musubi_tuner.training.loraga_streaming import GradientStore, WeightCache, available_host_memory, streamed_linears
 
 logger = logging.getLogger(__name__)
 CACHE_NAME = "loraga_init.safetensors"
@@ -36,6 +36,30 @@ def add_arguments(parser):
         "--loraga_init_only", action="store_true", help="Create/validate initialization cache and exit before optimizer setup"
     )
     parser.add_argument("--loraga_work_dir", type=str, help="Temporary disk gradient storage (default: system temp)")
+    parser.add_argument(
+        "--loraga_gradient_ram_gb",
+        type=float,
+        default=-1,
+        help="FP32 gradient RAM budget in GiB: -1 auto (leave 3 GiB free), 0 disk only",
+    )
+    parser.add_argument(
+        "--loraga_gpu_cache_gb",
+        type=float,
+        default=-1,
+        help="Spare VRAM budget for gradient spill and immutable weights: -1 auto after first batch, 0 disabled",
+    )
+    parser.add_argument(
+        "--loraga_gpu_reserve_gb",
+        type=float,
+        default=1.0,
+        help="VRAM safety margin in GiB, in addition to measured transient working memory",
+    )
+    parser.add_argument(
+        "--loraga_svd_device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="FP32 randomized SVD device; auto uses CUDA when its workspace fits",
+    )
     parser.add_argument(
         "--loraga_max_quantization_error_ratio",
         type=float,
@@ -64,6 +88,12 @@ def validate_args(args):
         raise ValueError("LoRA-GA FP8 requires both --fp8_base and --fp8_scaled (or neither for BF16)")
     if args.loraga_estimation_batches <= 0 or args.network_dim is None or args.network_dim <= 0:
         raise ValueError("LoRA-GA estimation_batches and network_dim must be positive")
+    for key in ("loraga_gradient_ram_gb", "loraga_gpu_cache_gb"):
+        value = getattr(args, key)
+        if not math.isfinite(value) or (value < 0 and value != -1):
+            raise ValueError(f"--{key} must be -1 (auto) or finite and nonnegative")
+    if not math.isfinite(args.loraga_gpu_reserve_gb) or args.loraga_gpu_reserve_gb < 0:
+        raise ValueError("--loraga_gpu_reserve_gb must be finite and nonnegative")
     if args.network_alpha is not None and (not math.isfinite(args.network_alpha) or args.network_alpha < 0):
         raise ValueError("LoRA-GA network_alpha must be finite and nonnegative (0 uses rank)")
     if not math.isfinite(args.loraga_max_quantization_error_ratio) or args.loraga_max_quantization_error_ratio <= 0:
@@ -194,25 +224,47 @@ def estimate(trainer, args, accelerator, model, network, targets, group, collato
     pool = trainer.timestep_range_pool
     initial = {}
     disk_bytes = sum(module.weight.numel() * 4 for module in targets.values())
+    ram_bytes = (
+        max(0, available_host_memory() - 3 * 2**30)
+        if args.loraga_gradient_ram_gb == -1
+        else int(args.loraga_gradient_ram_gb * 2**30)
+    )
+    ram_bytes = min(ram_bytes, disk_bytes)
     work_dir = args.loraga_work_dir
     if work_dir:
         Path(work_dir).mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(work_dir or tempfile.gettempdir()).free < disk_bytes * 1.1:
-        raise ValueError(f"LoRA-GA needs at least {disk_bytes} bytes of free gradient storage plus temporary matrix space")
-    logger.info("LoRA-GA: %s target gradient bytes on disk; CPU BF16 backbone, FP32 per-matrix SVD", disk_bytes)
+    spill_bytes = disk_bytes - ram_bytes
+    if shutil.disk_usage(work_dir or tempfile.gettempdir()).free < spill_bytes * 1.1:
+        raise ValueError(f"LoRA-GA needs at least {spill_bytes} bytes of free gradient spill storage plus temporary matrix space")
+    logger.info(
+        "LoRA-GA: %.2f GiB FP32 gradients; RAM budget %.2f GiB, disk spill at most %.2f GiB; SVD device=%s",
+        disk_bytes / 2**30,
+        ram_bytes / 2**30,
+        spill_bytes / 2**30,
+        args.loraga_svd_device,
+    )
+    if args.loraga_svd_device == "cuda" and accelerator.device.type != "cuda":
+        raise ValueError("--loraga_svd_device cuda requires a CUDA accelerator")
+    weight_cache = WeightCache()
+    gpu_gradient_bytes = cached_weight_bytes = 0
+    estimation_seconds = svd_seconds = 0.0
     if accelerator.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(accelerator.device)
     try:
         with isolated_rng(), tempfile.TemporaryDirectory(dir=work_dir, prefix="musubi-loraga-") as directory:
             seed_rng(args.loraga_seed)
             trainer.timestep_range_pool = []
-            sink = DiskGradients(directory)
+            sink = GradientStore(directory, ram_bytes=ram_bytes)
             model.train()
             # Always checkpoint Phase A, independently of Phase B's setting.
             model.enable_gradient_checkpointing(False)
-            with streamed_linears(model, targets, sink, accelerator.device):
+            with streamed_linears(
+                model, targets, sink, accelerator.device, weight_cache=weight_cache, pin_memory=accelerator.device.type == "cuda"
+            ):
                 iterator = iter(loader)
+                estimation_started = time.perf_counter()
                 for index in range(args.loraga_estimation_batches):
+                    batch_started = time.perf_counter()
                     try:
                         batch = next(iterator)
                     except StopIteration:
@@ -240,20 +292,80 @@ def estimate(trainer, args, accelerator, model, network, targets, group, collato
                         raise ValueError("Nonfinite LoRA-GA estimation loss")
                     loss.backward()
                     del loss, batch, latents, noise
-                    logger.info("LoRA-GA gradient batch %s/%s", index + 1, args.loraga_estimation_batches)
-            for lora in network.unet_loras:
+                    if accelerator.device.type == "cuda":
+                        torch.cuda.synchronize(accelerator.device)
+                    logger.info(
+                        "LoRA-GA gradient batch %s/%s: %.3fs",
+                        index + 1,
+                        args.loraga_estimation_batches,
+                        time.perf_counter() - batch_started,
+                    )
+                    if (
+                        index == 0
+                        and args.loraga_estimation_batches > 1
+                        and accelerator.device.type == "cuda"
+                        and args.loraga_gpu_cache_gb != 0
+                    ):
+                        # First backward measures actual activations/GEMM workspace. Keep 25% growth room
+                        # plus a user-visible safety margin for other buckets and desktop VRAM usage.
+                        torch.cuda.empty_cache()
+                        free, _ = torch.cuda.mem_get_info(accelerator.device)
+                        working = torch.cuda.max_memory_allocated(accelerator.device) - torch.cuda.memory_allocated(
+                            accelerator.device
+                        )
+                        budget = max(0, int(free - working * 1.25 - args.loraga_gpu_reserve_gb * 2**30))
+                        if args.loraga_gpu_cache_gb >= 0:
+                            budget = min(budget, int(args.loraga_gpu_cache_gb * 2**30))
+                        gpu_gradient_bytes = sink.promote_spill_to_cuda(budget, accelerator.device)
+                        weight_cache.fill(model, targets, budget - gpu_gradient_bytes, accelerator.device)
+                        cached_weight_bytes = weight_cache.bytes
+                        logger.info(
+                            "LoRA-GA warmup: %.2f GiB transient VRAM; CUDA gradient cache %.2f GiB, weight cache %.2f GiB",
+                            working / 2**30,
+                            gpu_gradient_bytes / 2**30,
+                            cached_weight_bytes / 2**30,
+                        )
+                estimation_seconds = time.perf_counter() - estimation_started
+            if accelerator.device.type == "cuda":
+                torch.cuda.empty_cache()
+            svd_started = time.perf_counter()
+            for index, lora in enumerate(network.unet_loras):
+                matrix_started = time.perf_counter()
                 gradient = sink.take(lora.lora_name, args.loraga_estimation_batches)
+                svd_device = torch.device("cpu")
+                if args.loraga_svd_device != "cpu" and accelerator.device.type == "cuda":
+                    free, _ = torch.cuda.mem_get_info(accelerator.device)
+                    workspace = gradient.numel() * 12 + sum(gradient.shape) * min(4 * lora.lora_dim, min(gradient.shape)) * 16
+                    if args.loraga_svd_device == "cuda" or free > workspace + args.loraga_gpu_reserve_gb * 2**30:
+                        svd_device = accelerator.device
                 initial[lora.lora_name] = initialize_factors(
-                    gradient, lora.lora_dim, lora.scale, args.loraga_direction, args.loraga_scale, args.loraga_stable_gamma
+                    gradient,
+                    lora.lora_dim,
+                    lora.scale,
+                    args.loraga_direction,
+                    args.loraga_scale,
+                    args.loraga_stable_gamma,
+                    device=svd_device,
                 )
                 del gradient
+                logger.info(
+                    "LoRA-GA SVD %s/%s on %s: %s, %.3fs",
+                    index + 1,
+                    len(network.unet_loras),
+                    svd_device,
+                    lora.lora_name,
+                    time.perf_counter() - matrix_started,
+                )
+            svd_seconds = time.perf_counter() - svd_started
     except (torch.OutOfMemoryError, MemoryError) as error:
         raise RuntimeError(
             "LoRA-GA BF16 initialization exhausted memory. Requires CPU backbone + offloaded activations, "
-            "one FP32 gradient/SVD workspace in RAM and one Linear/attention operation in VRAM. "
-            "Reduce cached resolution/batch size; no alternate initialization was used."
+            "bounded FP32 gradient storage, per-matrix SVD workspace and one Linear/attention operation in VRAM. "
+            "Reduce --loraga_gpu_cache_gb or increase --loraga_gpu_reserve_gb for CUDA exhaustion; "
+            "reduce --loraga_gradient_ram_gb for host RAM exhaustion. No alternate initialization was used."
         ) from error
     finally:
+        weight_cache.clear()
         trainer.timestep_range_pool = pool
         model.disable_gradient_checkpointing()
         model.eval()
@@ -263,6 +375,14 @@ def estimate(trainer, args, accelerator, model, network, targets, group, collato
     metrics = {
         "loraga/initialization_seconds": time.perf_counter() - started,
         "loraga/estimated_batches": args.loraga_estimation_batches,
+        "loraga/gradient_collection_seconds": estimation_seconds,
+        "loraga/svd_seconds": svd_seconds,
+        "loraga/gradient_ram_budget_bytes": ram_bytes,
+        "loraga/gradient_cuda_cache_bytes": gpu_gradient_bytes,
+        "loraga/weight_cuda_cache_bytes": cached_weight_bytes,
+        "loraga/weight_cache_hits": weight_cache.hits,
+        "loraga/gradient_disk_read_bytes": sink.read_bytes,
+        "loraga/gradient_disk_write_bytes": sink.write_bytes,
     }
     if accelerator.device.type == "cuda":
         metrics["loraga/initialization_peak_vram_bytes"] = torch.cuda.max_memory_allocated(accelerator.device)
