@@ -46,6 +46,9 @@ class Flux2NetworkTrainer(NetworkTrainer):
         from musubi_tuner.training.flux2_loraga import validate_args
 
         validate_args(args)
+        from musubi_tuner.optimizers.polora import validate_args as validate_polora_args
+
+        validate_polora_args(args)
         self.model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
         self.dit_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
         self._i2v_training = False
@@ -55,7 +58,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
     def _build_dataset(self, args):
         result = super()._build_dataset(args)
-        if getattr(args, "loraga", False):
+        if getattr(args, "loraga", False) or args.optimizer_type.lower() == "polora":
             self._loraga_dataset = result[:2]
             self._loraga_training_group = result[0]
             self._loraga_progress = {"global_step": 0, "epoch": 0, "next_batch": 0}
@@ -70,6 +73,14 @@ class Flux2NetworkTrainer(NetworkTrainer):
     ):
         if not getattr(args, "validation_dataset_config", None):
             return
+        if accelerator.trackers:
+            from musubi_tuner.training.memory_diagnostics import MemoryDiagnostics
+
+            if not hasattr(self, "memory_diagnostics"):
+                self.memory_diagnostics = MemoryDiagnostics(accelerator.device)
+            memory_metrics = self.memory_diagnostics.snapshot("memory/train")
+            if memory_metrics:
+                accelerator.log(memory_metrics, step=global_step)
         if global_step % args.validation_every_n_steps:
             return
         from musubi_tuner.training.flux2_validation import evaluate_validation
@@ -278,6 +289,13 @@ class Flux2NetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
+        from musubi_tuner.training.cuda_memory import configure_cuda_memory_budget
+
+        configure_cuda_memory_budget(
+            accelerator.device,
+            getattr(args, "cuda_memory_fraction", None),
+            block_swap=bool(args.blocks_to_swap),
+        )
         loraga = getattr(args, "loraga", False)
         if loraga:
             from musubi_tuner.training.flux2_loraga import validate_checkpoint
@@ -315,6 +333,10 @@ class Flux2NetworkTrainer(NetworkTrainer):
         return network
 
     def _register_hooks_and_resume(self, args, accelerator, network):
+        if args.optimizer_type.lower() == "polora":
+            from musubi_tuner.training.polora import register_resume
+
+            register_resume(self, args, accelerator)
         if getattr(args, "loraga", False):
             from musubi_tuner.training.flux2_loraga import register_resume
 
@@ -415,6 +437,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
 def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Flux.2-dev specific parser setup"""
     from musubi_tuner.training.flux2_loraga import add_arguments
+    from musubi_tuner.training.cuda_memory import memory_fraction
 
     add_arguments(parser)
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
@@ -425,6 +448,10 @@ def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument("--validation_every_n_steps", type=int, default=None, help="Evaluate every N completed optimizer steps")
     parser.add_argument("--validation_max_batches", type=int, default=None, help="Maximum singleton validation batches; default: all")
     parser.add_argument("--validation_seed", type=int, default=42, help="Stable per-example validation noise/timestep seed")
+    parser.add_argument(
+        "--cuda_memory_fraction", type=memory_fraction, default=None,
+        help="CUDA allocator budget in (0, 1]; default: 0.85 for Windows block swap, unchanged otherwise",
+    )
     return parser
 
 

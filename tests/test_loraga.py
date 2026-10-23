@@ -154,13 +154,15 @@ def model_inputs(device):
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_native_export_load_and_frozen_training(tmp_path, device):
+@pytest.mark.parametrize("plus_ratio", [None, 4.0])
+def test_native_export_load_and_frozen_training(tmp_path, device, plus_ratio):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     torch.manual_seed(8)
     original = tiny_model()
     model = copy.deepcopy(original)
-    network = lora_flux_2.create_arch_network(1, 2, 1, None, None, model)
+    kwargs = {} if plus_ratio is None else {"loraplus_lr_ratio": plus_ratio}
+    network = lora_flux_2.create_arch_network(1, 2, 1, None, None, model, **kwargs)
     initial = {
         module.lora_name: initialize_factors(torch.randn_like(module.org_module.weight.float()).cpu(), 2, 0.5)
         for module in network.unet_loras
@@ -187,7 +189,8 @@ def test_native_export_load_and_frozen_training(tmp_path, device):
         actual_initial = model(**inputs).float()
     assert (actual_initial - expected_initial).square().mean().sqrt() < 0.02
     frozen = {key: value.clone() for key, value in model.state_dict().items()}
-    optimizer = torch.optim.AdamW(network.parameters(), lr=1e-3)
+    groups, _ = network.prepare_optimizer_params(unet_lr=1e-3)
+    optimizer = torch.optim.AdamW(groups, lr=1e-3)
     with torch.autocast(device, dtype=torch.bfloat16):
         loss = model(**inputs).float().square().mean()
     loss.backward()
@@ -362,6 +365,7 @@ def test_two_stage_native_cached_objective_and_reuse(tmp_path, monkeypatch):
     initialized = initialize(trainer, args, accelerator, model)
     assert next(initialized.double_blocks[0].img_attn.qkv.parameters()).dtype == torch.float8_e4m3fn
     assert trainer._loraga_metrics["loraga/estimated_batches"] == 2
+    assert trainer._loraga_metrics["loraga/estimated_batches_this_run"] == 2
     assert trainer._loraga_metrics["loraga/output_error_ratio"] < 3
     assert trainer._loraga_metrics["loraga/initial_output_relative_error"] < 0.05
     assert all(parameter.grad is None and not parameter.requires_grad for parameter in initialized.parameters())
@@ -380,7 +384,12 @@ def test_two_stage_native_cached_objective_and_reuse(tmp_path, monkeypatch):
     args.loraga_gradient_ram_gb = 0
     args.loraga_gpu_cache_gb = 0
     args.loraga_svd_device = "cpu"
+    args.network_args = ["loraplus_lr_ratio=4"]
     initialize(trainer, args, accelerator, second)
+    assert trainer._loraga_metrics["loraga/estimated_batches_this_run"] == 0
+    assert trainer._loraga_metrics["loraga/gradient_collection_seconds"] == 0
+    assert trainer._loraga_metrics["loraga/svd_seconds"] == 0
+    assert trainer._loraga_metrics["loraga/cache_origin/gradient_collection_seconds"] > 0
     for key, value in initialized.state_dict().items():
         other = second.state_dict()[key]
         assert value.dtype == other.dtype
@@ -390,13 +399,18 @@ def test_two_stage_native_cached_objective_and_reuse(tmp_path, monkeypatch):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
-def test_accelerate_state_restores_raw_factors_optimizer_rng_and_metadata(tmp_path):
+@pytest.mark.parametrize("plus_ratio", [None, 4.0])
+def test_accelerate_state_restores_raw_factors_optimizer_rng_and_metadata(tmp_path, plus_ratio):
     trainer, args = cached_training_fixture(tmp_path, fp8=False)
+    if plus_ratio is not None:
+        args.network_args = [f"loraplus_lr_ratio={plus_ratio}"]
     model = tiny_model()
-    network = lora_flux_2.create_arch_network(1, 2, 2, None, None, model)
+    kwargs = {} if plus_ratio is None else {"loraplus_lr_ratio": plus_ratio}
+    network = lora_flux_2.create_arch_network(1, 2, 2, None, None, model, **kwargs)
     network.apply_to(None, model, apply_text_encoder=False)
     accelerator = Accelerator(mixed_precision="bf16")
-    optimizer = torch.optim.AdamW(network.parameters(), lr=1e-3)
+    groups, _ = network.prepare_optimizer_params(unet_lr=1e-3)
+    optimizer = torch.optim.AdamW(groups, lr=1e-3)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1)
     network, optimizer, scheduler = accelerator.prepare(network, optimizer, scheduler)
     trainer._loraga_initial = {
@@ -427,6 +441,13 @@ def test_accelerate_state_restores_raw_factors_optimizer_rng_and_metadata(tmp_pa
     expected_lr = scheduler.get_last_lr()
     directory = tmp_path / "state"
     accelerator.save_state(str(directory))
+    assert len(optimizer.param_groups) == (1 if plus_ratio is None else 2)
+    if plus_ratio is None:
+        # A pre-LoRA+ state must remain resumable without enabling new optimizer groups.
+        progress_path = directory / "loraga_progress.json"
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        del progress["signature"]["loraplus_lr_ratio"]
+        progress_path.write_text(json.dumps(progress), encoding="utf-8")
     expected_random = torch.randn(3)
     with torch.no_grad():
         for parameter in network.parameters():
@@ -434,6 +455,14 @@ def test_accelerate_state_restores_raw_factors_optimizer_rng_and_metadata(tmp_pa
     scheduler.step()
     trainer._loraga_progress = {"global_step": 99, "epoch": 1, "next_batch": 0}
     trainer.timestep_range_pool = []
+    progress_path = directory / "loraga_progress.json"
+    progress_text = progress_path.read_text(encoding="utf-8")
+    incompatible_progress = json.loads(progress_text)
+    incompatible_progress["signature"]["loraplus_lr_ratio"] = 2.0
+    progress_path.write_text(json.dumps(incompatible_progress), encoding="utf-8")
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        accelerator.load_state(str(directory))
+    progress_path.write_text(progress_text, encoding="utf-8")
     accelerator.load_state(str(directory))
     assert trainer._loraga_progress == {"global_step": 3, "epoch": 0, "next_batch": 1}
     assert trainer.timestep_range_pool == [(0.1, 0.2)]
@@ -446,13 +475,16 @@ def test_accelerate_state_restores_raw_factors_optimizer_rng_and_metadata(tmp_pa
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_real_training_loop_tensorboard_and_resume_are_identical(tmp_path, monkeypatch):
+@pytest.mark.parametrize("plus_ratio", [None, 2.0])
+def test_real_training_loop_tensorboard_and_resume_are_identical(tmp_path, monkeypatch, plus_ratio):
     from dataclasses import replace
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     from musubi_tuner.flux_2 import flux2_utils
 
     torch.manual_seed(42)
     _, args = cached_training_fixture(tmp_path, count=6)
+    if plus_ratio is not None:
+        args.network_args = [f"loraplus_lr_ratio={plus_ratio}"]
     info = flux2_utils.FLUX2_MODEL_INFO["klein-base-4b"]
     params = Flux2Params(
         in_channels=8,
@@ -486,6 +518,8 @@ def test_real_training_loop_tensorboard_and_resume_are_identical(tmp_path, monke
     events = list((tmp_path / "logs").rglob("events.out.tfevents.*"))
     accumulator = EventAccumulator(str(events[0])).Reload()
     assert "loraga/initial_output_error" in accumulator.Tags()["scalars"]
+    if plus_ratio is not None:
+        assert "lr/unet plus" in accumulator.Tags()["scalars"]
     assert len(accumulator.Scalars("loss/current")) == 8
     # Mid-epoch, epoch boundary, and already-completed states must all resume safely.
     for checkpoint_step in (2, 3, 4):

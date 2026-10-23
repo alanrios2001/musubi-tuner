@@ -68,6 +68,24 @@ def add_arguments(parser):
     )
 
 
+def loraplus_lr_ratio(args):
+    """Allow only native LoRA+ optimizer grouping; keep GA's target/factor construction fixed."""
+    ratio = None
+    for argument in args.network_args or []:
+        key, separator, value = argument.partition("=")
+        if key != "loraplus_lr_ratio" or not separator:
+            raise ValueError("LoRA-GA only supports --network_args loraplus_lr_ratio=<positive finite ratio>")
+        if ratio is not None:
+            raise ValueError("Duplicate LoRA-GA loraplus_lr_ratio")
+        try:
+            ratio = float(value)
+        except ValueError as error:
+            raise ValueError("LoRA-GA loraplus_lr_ratio must be finite and positive") from error
+        if not math.isfinite(ratio) or ratio <= 0:
+            raise ValueError("LoRA-GA loraplus_lr_ratio must be finite and positive")
+    return ratio
+
+
 def validate_args(args):
     resume = Path(args.resume) if args.resume else None
     if not args.loraga:
@@ -80,9 +98,10 @@ def validate_args(args):
         raise ValueError("LoRA-GA currently requires --model_version klein-base-4b --mixed_precision bf16")
     if args.network_module not in ("networks.lora_flux_2", "musubi_tuner.networks.lora_flux_2"):
         raise ValueError("LoRA-GA supports only networks.lora_flux_2 Linear adapters")
-    if args.network_args or args.network_dropout or args.base_weights or args.network_weights or args.dim_from_weights:
+    loraplus_lr_ratio(args)
+    if args.network_dropout or args.base_weights or args.network_weights or args.dim_from_weights:
         raise ValueError(
-            "LoRA-GA does not support network_args/dropout/base_weights/network_weights/dim_from_weights; resume with --resume"
+            "LoRA-GA does not support dropout/base_weights/network_weights/dim_from_weights; resume with --resume"
         )
     if args.fp8_base != args.fp8_scaled:
         raise ValueError("LoRA-GA FP8 requires both --fp8_base and --fp8_scaled (or neither for BF16)")
@@ -476,6 +495,28 @@ def output_probe(trainer, args, accelerator, model, inputs, targets, initial=Non
     return output
 
 
+def reused_estimation_metrics(metrics):
+    """Keep cached provenance separate from work performed by the current run."""
+    metrics = dict(metrics)
+    origin = "loraga/cache_origin/"
+    metrics.setdefault(
+        origin + "estimation_seconds", metrics.get("loraga/estimation_seconds", metrics["loraga/initialization_seconds"])
+    )
+    for name in (
+        "gradient_collection_seconds", "svd_seconds", "gradient_ram_budget_bytes",
+        "gradient_cuda_cache_bytes", "weight_cuda_cache_bytes", "weight_cache_hits",
+        "gradient_disk_read_bytes", "gradient_disk_write_bytes", "initialization_peak_vram_bytes",
+    ):
+        key = "loraga/" + name
+        if key in metrics:
+            metrics.setdefault(origin + name, metrics.pop(key))
+    metrics["loraga/estimation_seconds"] = 0.0
+    metrics["loraga/gradient_collection_seconds"] = 0.0
+    metrics["loraga/svd_seconds"] = 0.0
+    metrics["loraga/estimated_batches_this_run"] = 0
+    return metrics
+
+
 def initialize(trainer, args, accelerator, model):
     started = time.perf_counter()
     if accelerator.num_processes != 1:
@@ -517,9 +558,12 @@ def initialize(trainer, args, accelerator, model):
     reused = source.exists()
     if source.exists():
         initial, metrics = load_cache(source, metadata)
+        metrics = reused_estimation_metrics(metrics)
         logger.info("Reusing LoRA-GA initialization: %s", source)
     else:
         initial, metrics = estimate(trainer, args, accelerator, model, network, targets, group, collator)
+        metrics["loraga/estimated_batches_this_run"] = args.loraga_estimation_batches
+        metrics["loraga/estimation_seconds"] = metrics["loraga/initialization_seconds"]
         save_cache(source, initial, metadata, metrics)
     scaling = float(args.network_alpha or args.network_dim) / args.network_dim
     # Evaluate compensated BF16 before applying persistent native FP8 quantization.
@@ -615,6 +659,8 @@ def register_resume(trainer, args, accelerator, network):
         "block_swap_ring_size",
     )
     signature = {key: getattr(args, key, None) for key in signature_keys}
+    # This changes optimizer groups, not the initialization, so keep it out of cache identity.
+    signature["loraplus_lr_ratio"] = loraplus_lr_ratio(args)
 
     def save(models, weights, directory):
         save_cache(Path(directory) / CACHE_NAME, trainer._loraga_initial, trainer._loraga_metadata, trainer._loraga_saved_metrics)
@@ -638,7 +684,10 @@ def register_resume(trainer, args, accelerator, network):
         ):
             raise ValueError("LoRA-GA resume initial factors differ from reconstructed backbone")
         state = json.loads((Path(directory) / "loraga_progress.json").read_text(encoding="utf-8"))
-        if state["signature"] != signature:
+        saved_signature = dict(state["signature"])
+        # Older states predate LoRA+ support and necessarily used one shared LR group.
+        saved_signature.setdefault("loraplus_lr_ratio", None)
+        if saved_signature != signature:
             raise ValueError("LoRA-GA resume optimizer/scheduler/batch configuration mismatch")
         restore_dataset(trainer._loraga_training_group, state["datasets"])
         trainer.timestep_range_pool = [tuple(value) for value in state["timestep_pool"]]

@@ -211,6 +211,57 @@ The former aliases existing `loss/current`; existing `loss/current`, `loss/avera
 metrics remain available. `val/num_samples` and `val/evaluation_seconds` are also logged.
 All use the existing Accelerator trackers and the global optimizer-step axis.
 
+With validation and a tracker enabled, memory diagnostics are logged automatically:
+
+| TensorBoard tag/prefix | Meaning |
+| --- | --- |
+| `train/optimizer_step_seconds` | Time for the accumulated training step, including backward and optimizer work, before periodic saving and validation. |
+| `memory/train/*` | Memory at every completed optimizer step, before periodic validation. |
+| `memory/before_validation/*` | Memory immediately before entering validation. |
+| `memory/validation_sampled_peak/*` | Maximum of the measurements taken after each validation batch. |
+| `memory/validation_peak/*` | PyTorch allocator high-water marks across validation, including temporary allocations between samples. |
+| `memory/validation_end/*` | Memory after releasing validation batch tensors, before restoring training execution. |
+| `memory/after_validation/*` | Memory after restoring training modes and preparing block placement. |
+
+Memory values use MiB. `allocated_mib` measures live PyTorch CUDA allocations;
+`reserved_mib` includes unused memory held by its caching allocator. On Windows,
+`process_dedicated_mib` and `process_shared_mib` also read native GPU Process Memory
+performance counters for the training PID, summed across its adapters. These process
+counters include memory outside the PyTorch allocator. Shared memory can include pinned
+transfer buffers as well as driver fallback; a nonzero value alone does not prove fallback.
+Unavailable Windows counters are omitted. No extra dependency or subprocess is required.
+
+Compare `memory/train/process_shared_mib` with `train/optimizer_step_seconds`, and
+compare `memory/before_validation/*` with `memory/after_validation/*` at the same step.
+The Windows peak is sampled once per batch and can miss shorter spikes; the PyTorch
+peak uses allocator statistics reset just before each validation. These readings do not
+add explicit CUDA synchronization, clear caches, or change model placement. Diagnostics
+start on the next training launch; an already running Python process will not load them.
+
+### Windows CUDA cache budget
+
+FLUX.2 training with block swap on Windows now caps PyTorch's CUDA allocator at
+85% of physical VRAM by default, with or without validation or logging. On an
+8 GiB GPU this is approximately 6963 MiB. This leaves room for the CUDA context,
+desktop, and allocations outside PyTorch. `--cuda_memory_fraction 0.80` changes
+the budget; `--cuda_memory_fraction 1` opts out of this headroom. A stricter
+allocator limit already set by a caller is preserved. Other platforms and
+training without block swap keep their existing default unless the flag is set.
+
+Variable training bucket sizes can grow the native allocator's cached segments
+well beyond the live tensors. Windows can satisfy new CUDA allocations using
+shared RAM instead of returning an allocation failure; in that case the
+allocator does not reach its usual cache-release-and-retry path. Setting the
+budget makes the allocator reclaim unused cached segments before expanding
+beyond that budget. No per-step `empty_cache()` or model/optimizer changes are
+needed. The new budget is installed before model loading.
+
+This bounds PyTorch's allocator, not total GPU usage. If live tensors themselves
+cannot fit within the budget, training reports an out-of-memory error rather
+than relying on shared RAM; increase block swap or lower resolution in that case.
+Confirm the change with `memory/train/reserved_mib` and
+`memory/train/process_shared_mib`, alongside `train/optimizer_step_seconds`.
+
 ## Execution and reproducibility
 
 - A small shared lifecycle hook runs outside accumulation, after step increment, weight-norm

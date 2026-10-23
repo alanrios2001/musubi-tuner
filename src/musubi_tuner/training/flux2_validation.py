@@ -170,6 +170,11 @@ def evaluate_validation(
     unwrapped_network = accelerator.unwrap_model(network)
     total_loss = 0.0
     num_samples = 0
+    diagnostics = getattr(trainer, "memory_diagnostics", None)
+    memory_metrics = {}
+    if diagnostics is not None:
+        memory_metrics.update(diagnostics.snapshot("memory/before_validation"))
+        diagnostics.begin_validation()
     with isolated_rng(), validation_execution(trainer, model, unwrapped_network):
         batches = loader if args.validation_max_batches is None else islice(loader, args.validation_max_batches)
         for batch in batches:
@@ -197,11 +202,20 @@ def evaluate_validation(
             count = latents.shape[0]
             total_loss += loss.detach().float().item() * count
             num_samples += count
+            if diagnostics is not None:
+                for key, value in diagnostics.snapshot("memory/validation_sampled_peak").items():
+                    memory_metrics[key] = max(memory_metrics.get(key, value), value)
             del loss, noise, latents, batch
+        if diagnostics is not None:
+            memory_metrics.update(diagnostics.validation_peaks())
+            memory_metrics.update(diagnostics.snapshot("memory/validation_end"))
+    if diagnostics is not None:
+        memory_metrics.update(diagnostics.snapshot("memory/after_validation"))
     if not num_samples:
         raise ValueError("Validation evaluated no samples")
     return {
         "val/loss": total_loss / num_samples,
         "val/num_samples": num_samples,
         "val/evaluation_seconds": time.perf_counter() - started,
+        **memory_metrics,
     }

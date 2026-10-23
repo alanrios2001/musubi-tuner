@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from safetensors.torch import save_file
 import torch
+from torch.utils._triton import has_triton
 
 from musubi_tuner.flux_2_train_network import Flux2NetworkTrainer, flux2_setup_parser
 from musubi_tuner.training.trainer_base import DiTOutput
@@ -293,6 +294,46 @@ def test_periodic_hook_logs_existing_tracker_axis_and_disabled_is_noop(monkeypat
     assert calls == [2, 4]
 
 
+def test_memory_logged_each_optimizer_step_and_validation_snapshots_follow_modes(monkeypatch):
+    trainer = ObjectiveTrainer()
+    accelerator = AcceleratorStub()
+    args = args_for_validation()
+    model = torch.nn.Linear(2, 2)
+    trainer.validation_loader = toy_batches()
+    snapshots = []
+
+    class Diagnostics:
+        samples = iter([10, 30, 20])
+
+        def snapshot(self, prefix):
+            snapshots.append((prefix, model.training))
+            value = next(self.samples) if prefix.endswith("sampled_peak") else 5
+            return {f"{prefix}/allocated_mib": value}
+
+        def begin_validation(self):
+            snapshots.append(("reset_peak", model.training))
+
+        def validation_peaks(self):
+            return {"memory/validation_peak/allocated_mib": 40}
+
+    trainer.memory_diagnostics = Diagnostics()
+    for step in (1, 2, 3):
+        trainer.on_completed_optimizer_step(args, accelerator, model, model, None, torch.float32, torch.float32, step)
+    train_logs = [(metrics, step) for metrics, step in accelerator.logs if "memory/train/allocated_mib" in metrics]
+    assert [step for _, step in train_logs] == [1, 2, 3]
+    validation = [metrics for metrics, _ in accelerator.logs if "val/loss" in metrics]
+    assert len(validation) == 1
+    assert validation[0]["memory/validation_sampled_peak/allocated_mib"] == 30
+    assert validation[0]["memory/validation_peak/allocated_mib"] == 40
+    assert ("memory/before_validation", True) in snapshots
+    assert ("memory/validation_end", False) in snapshots
+    assert ("memory/after_validation", True) in snapshots
+    args.validation_dataset_config = None
+    before = len(snapshots)
+    trainer.on_completed_optimizer_step(args, accelerator, model, model, None, None, None, 4)
+    assert len(snapshots) == before
+
+
 def test_disabled_dataset_build_has_no_validation_components(monkeypatch):
     from musubi_tuner.training.trainer_base import NetworkTrainer
 
@@ -344,13 +385,20 @@ def test_cuda_rng_is_restored():
         ("h2d", False, False),
         ("h2d", True, False),
         ("h2d", True, True),
+        pytest.param(
+            "h2d", "inductor", True,
+            marks=pytest.mark.skipif(
+                not has_triton(), reason="Working CUDA Triton unavailable"
+            ),
+        ),
     ],
 )
 def test_cuda_flux2_lora_training_resumes_after_repeated_validation(tmp_path, swap_mode, compiled, fp8):
     """Reduced Klein architecture, real BF16/LoRA/checkpointing/SDPA/offload execution.
 
     This is a synthetic architecture smoke test, not a pretrained 4B quality/VRAM test.
-    Dynamo's eager backend exercises the repository's compile wrapper without requiring Triton.
+    The Inductor case also exercises CUDA compilation across train/eval transitions.
+    Other compiled cases use Dynamo's eager backend without requiring Triton.
     """
     from accelerate.utils import send_to_device
     from musubi_tuner.flux_2.flux2_models import Flux2, Klein4BParams
@@ -358,7 +406,8 @@ def test_cuda_flux2_lora_training_resumes_after_repeated_validation(tmp_path, sw
     from musubi_tuner.networks.lora_flux_2 import create_arch_network
 
     device = torch.device("cuda")
-    args = args_for_validation(gradient_checkpointing=True, compile_backend="eager")
+    backend = compiled if isinstance(compiled, str) else "eager"
+    args = args_for_validation(gradient_checkpointing=True, compile_backend=backend)
     trainer = Flux2NetworkTrainer()
     trainer.num_timestep_buckets = None
     model = Flux2(

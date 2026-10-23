@@ -48,6 +48,8 @@ three-batch gradient accumulation. No GaLore or reduced-rank approximation is us
    `out_features**0.25 / sqrt(gamma)`, with upstream gamma default 16.
    SVD runs on CUDA by default when its estimated workspace fits, otherwise CPU.
    Factors return to CPU after each SVD; full backbone gradients never reside in VRAM.
+   SVD explicitly disables outer autocast and CUDA TF32 for its FP32 matrix products,
+   restoring the caller's precision settings even if decomposition fails.
 5. Save FP32 initial factors and compatibility metadata. Compensate each CPU
    backbone matrix: `Wc = BF16(FP32(W) - (alpha/r)*(B0@A0))`.
 6. Measure deterministic cached-batch output and weight errors. Then use Musubi's
@@ -91,7 +93,8 @@ CPU/FP32-input gradient calculations and SVD precision are unchanged. See the
 | `--loraga_max_quantization_error_ratio` | `2.0`; fail if aggregate weight or probe-output RMSE exceeds this multiple of ordinary FP8 RMSE |
 
 Other upstream direction/scale choices (`random`, `weightS`) and norm clipping are
-not exposed. Network kwargs, split adapters, dropout, other network types,
+not exposed. The only supported network kwarg is `loraplus_lr_ratio`, described
+below. Other network kwargs, split adapters, dropout, other network types,
 `--network_weights`, `--dim_from_weights`, and merged `--base_weights` are rejected.
 Alpha 0/None follows Musubi's existing convention: alpha equals rank.
 
@@ -100,6 +103,85 @@ To reproduce the old storage/device strategy, use `--loraga_gradient_ram_gb 0
 invalidate a completed initialization cache. Fresh CPU and CUDA randomized SVDs
 can choose different signs/random bases and differ in floating-point rounding;
 they use the same reference algorithm and are not promised bit-for-bit identical.
+
+## Combining LoRA-GA and LoRA+
+
+Enable native Musubi LoRA+ optimizer groups alongside GA with:
+
+```text
+--loraga --network_args loraplus_lr_ratio=2
+```
+
+`--learning_rate` sets A's rate; B's rate is multiplied by the supplied positive,
+finite ratio. With the current `5e-5` base rate, ratio 2 gives A=`5e-5`, B=`1e-4`;
+ratio 4 gives B=`2e-4`, and ratio 16 gives B=`8e-4`. Omission retains the ordinary
+single optimizer group. An explicit ratio 1 creates two equal-rate groups.
+Duplicate ratios, zero/negative/nonfinite ratios and unrelated network kwargs
+are rejected before initialization. The conventional non-GA path is unchanged.
+
+The supplied wrapper keeps its existing behavior without parameters. For an
+explicit combined experiment:
+
+```powershell
+& D:\repos\train.ps1 -LoRAPlusRatio 2
+```
+
+This adds the network argument while retaining GA and uses output name
+`change_clothes_768_ga_plus2`, keeping the existing GA-only adapters separate.
+The wrapper's default ratio 0 means disabled and is never passed to the trainer.
+Direct CLI users should also choose a separate output name/directory.
+
+Phase A is unchanged: the gradient objective, SVD, initial factors and compensation
+do not depend on optimizer learning rates. An existing compatible GA cache can
+be reused without estimation when enabling LoRA+. Phase B uses Musubi's existing
+A/B optimizer groups, scheduler and TensorBoard rates `lr/unet` and `lr/unet plus`.
+The adapter rank, effective alpha/rank, inference loading and rank-2r export do
+not change. No PEFT optimizer or new package is introduced.
+
+For exact resumption, save Accelerate state with `--save_state` and retain both
+the LoRA+ enable/disable setting and ratio. Changing either is rejected before
+optimizer state is loaded. Legacy GA state without ratio metadata remains
+resumable with LoRA+ disabled. A rank-2r inference export is not resumable state.
+The wrapper currently leaves `--save_state` to the user's training configuration.
+
+### Can the combination be worse?
+
+Yes. The [LoRA+ authors](https://github.com/nikhilgsh/loraplus#best-practice) state
+that the LR ratio depends on model/task and must be tuned together with the base
+LR. Their standalone gains do not establish gains for GA plus Klein.
+The [LoRA-GA derivation](https://arxiv.org/html/2407.05000v2#S3.SS2) initially uses
+the same learning rate for A and B; Appendix F explicitly leaves combinations
+with other improvements unvalidated. No direct Klein GA+LoRA+ quality benchmark
+was found in these primary references.
+
+For an ordinary gradient-descent step with gradient G, the first-order effective
+weight update is proportional to:
+
+```text
+-s^2 * (lr_B * G @ A.T @ A + lr_A * B @ B.T @ G)
+```
+
+Thus different rates reweight GA's complementary singular subspaces. Under
+`ArB2r`, increasing B's rate strengthens the contribution associated with A's
+top-r right singular vectors. It does not retain the equal-rate approximation
+unchanged. This is a first-order SGD explanation, not an exact AdamW update
+formula. AdamW preconditioning, clipping and weight decay further affect updates.
+The implementation deliberately keeps the original GA factors rather than
+inventing an LR-dependent rescaling of the reference initialization.
+
+A larger B rate can overshoot, increase clipping or degrade held-out quality.
+Ratio 2 is a modest experiment, not a validated optimum or a guarantee of safety;
+the standalone ratio 16 should not be assumed optimal for this combination.
+Compare ratios disabled/1/2/4 using the same GA initialization cache, base LR,
+dataset order, effective batch size, budget and held-out prompts. Record validation
+loss, generated edits, clipping frequency, throughput and peak VRAM. Test lower
+base LR in a separate controlled sweep if necessary. Merely enabling LoRA+ does
+not directly reduce time per step, VRAM pressure or the initial FP8 probe error.
+
+Tests cover strict argument validation, unchanged cache reuse, actual native
+optimizer group membership/rates, scheduler ratio, frozen FP8 backbone training,
+standard export/loading and exact two-group Accelerate resume. Synthetic tests
+establish execution correctness, not pretrained Klein image-quality gains.
 
 ## Windows PowerShell
 
@@ -155,6 +237,22 @@ memory. These are example commands, not a measured 768px/8GB capacity guarantee.
 `--compile` uses the existing compiler path after initialization; Windows still
 needs a working backend/Triton installation. `--compile_backend eager` can exercise
 the integration without claiming Inductor performance.
+
+For the tested Windows venv with PyTorch `2.6.0+cu124`, install the matching
+Triton 3.2 release (do not install the latest minor version blindly):
+
+```powershell
+& $python -m pip install 'triton-windows==3.2.0.post21'
+```
+
+The [Windows Triton compatibility table](https://github.com/triton-lang/triton-windows/blob/readme/README.md#3-pytorch)
+maps PyTorch 2.6 to Triton 3.2. Compilation is lazy: training with checkpointing
+can reach validation before an evaluation graph first requires a CUDA compiler.
+The supplied `D:\repos\train.ps1` now checks a CUDA Inductor forward, backward,
+and no-grad execution before launching training, preserving the Inductor backend.
+It also enables `--save_state`, so periodic checkpoints include resumable state.
+An existing exported adapter alone does not contain optimizer/scheduler/RNG state
+and cannot provide exact resumption. The initialization cache is still reusable.
 
 For BF16 backbone training, omit both FP8 switches. Existing attention modes remain
 subject to their ordinary trainer restrictions; SageAttention training is already
@@ -250,6 +348,13 @@ training batch. Initialization-only runs print metrics to the console. Metrics
 include initialization and estimation/SVD time, estimated batches, cache reuse,
 peak estimation VRAM, BF16 output RMSE/relative RMSE, ordinary/compensated FP8
 output RMSE, weight RMSE, and both FP8 error ratios. Training loss tags are preserved.
+When a cache is reused, `loraga/estimation_seconds`, gradient collection time, SVD
+time and `loraga/estimated_batches_this_run` are zero. Original estimation times,
+VRAM peaks, storage counters and cache budgets are retained under
+`loraga/cache_origin/*`; `loraga/estimated_batches` describes the cached factors.
+`loraga/initialization_seconds` always measures the current initialization pass,
+including compatibility checks and numerical probes. See the
+[implementation review](flux_2_loraga_review.md) for the reference audit and limits.
 Additional performance metrics separate gradient collection and SVD time, report
 RAM/CUDA cache budgets and weight-cache hits, and count gradient payload bytes
 read/written to disk. Each gradient batch and each matrix SVD logs its duration.
@@ -335,6 +440,7 @@ until restarted; changing source files does not patch an active initialization.
 
 ```powershell
 & $python -m pytest tests/test_loraga.py tests/test_loraga_performance.py `
+    tests/test_loraga_audit.py tests/test_loraga_plus.py `
     tests/test_flux2_validation.py tests/test_lora_dtype_bridging.py `
     tests/test_save_precision.py tests/test_top_level_entrypoints.py -q
 ```
@@ -346,10 +452,14 @@ loading onto BF16 and ordinary FP8, conventional zero-up initialization, atomic
 cache validation/reuse, raw Accelerate state restoration, real TensorBoard training,
 AdamW8bit accumulated-gradient resume, gradient checkpointing, ordinary and
 H2D-only block swapping, stable allocations after warmup, and compilation with the
-`eager` backend. Inductor and full-sized image-quality tests remain unmeasured.
+`eager` backend. A CUDA Inductor regression additionally tests BF16, native scaled
+FP8, gradient checkpointing, H2D-only swapping, repeated validation, restored RNG
+and adapter state, and return to optimization on a reduced Klein architecture.
+This passed on the RTX 3070 Ti with PyTorch 2.6.0+cu124 and
+triton-windows 3.2.0.post21. Full-sized image-quality tests remain unmeasured.
 
-Recorded results: **81 tests passed**: 30 LoRA-GA lifecycle tests, 9 performance/
-storage correctness tests, and 42 focused existing regression tests (validation,
+Recorded results: **115 tests passed**: 34 LoRA-GA lifecycle tests, 9 performance/
+storage correctness tests, 12 numerical review tests, 17 LoRA+ tests, and 43 focused regression tests (validation,
 dtype bridging, save precision, and top-level entry points).
 The full-loop resume test also covers epoch-boundary and already-completed states.
 Ruff and `git diff --check` passed. Existing block-swapping pin-memory deprecation

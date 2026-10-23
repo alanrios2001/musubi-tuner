@@ -219,7 +219,7 @@ class NetworkTrainer:
             "grad/max": max_grad.item(),
         }
 
-    def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
+    def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter], network=None) -> tuple[str, str, torch.optim.Optimizer]:
         # adamw, adamw8bit, adafactor
 
         optimizer_type = args.optimizer_type.lower()
@@ -236,7 +236,14 @@ class NetworkTrainer:
         optimizer = None
         optimizer_class = None
 
-        if optimizer_type.endswith("8bit".lower()):
+        if optimizer_type == "polora":
+            from musubi_tuner.optimizers.polora import Polora, create_optimizer
+
+            optimizer_class = Polora
+            optimizer = create_optimizer(network, trainable_params, lr=lr, **optimizer_kwargs)
+            logger.info("PoLoRA active: %s Linear pairs, pair_batch_size=%s, shared LR=%s, FP32 state",
+                        len(optimizer.pairs), optimizer.pair_batch_size, lr)
+        elif optimizer_type.endswith("8bit".lower()):
             try:
                 import bitsandbytes as bnb
             except ImportError:
@@ -1757,8 +1764,9 @@ class NetworkTrainer:
 
         trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
         trainable_params = self.extra_trainable_params(args, accelerator, network, transformer, trainable_params)
+        optimizer_context = {"network": network} if args.optimizer_type.lower() == "polora" else {}
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
-            args, trainable_params
+            args, trainable_params, **optimizer_context
         )
 
         # prepare dataloader
@@ -2060,7 +2068,7 @@ class NetworkTrainer:
 
         epoch_to_start = 0
         global_step = 0
-        if getattr(args, "loraga", False):
+        if hasattr(self, "_loraga_progress"):
             epoch_to_start = self._loraga_progress["epoch"]
             global_step = self._loraga_progress["global_step"]
             if self._loraga_progress["next_batch"] >= len(train_dataloader):
@@ -2179,7 +2187,7 @@ class NetworkTrainer:
 
             epoch_loader = train_dataloader
             first_batch = 0
-            if getattr(args, "loraga", False):
+            if hasattr(self, "_loraga_progress"):
                 # Private generator recreates sampler order without consuming training RNG.
                 generator = torch.Generator().manual_seed((args.seed if args.seed is not None else args.loraga_seed) + epoch)
                 train_dataloader.base_dataloader.generator = generator
@@ -2187,7 +2195,10 @@ class NetworkTrainer:
                 first_batch = self._loraga_progress["next_batch"] if epoch == self._loraga_progress["epoch"] else 0
                 epoch_loader = accelerate.skip_first_batches(train_dataloader, first_batch) if first_batch else train_dataloader
 
+            optimizer_step_started = None
             for step, batch in enumerate(epoch_loader, start=first_batch):
+                if optimizer_step_started is None:
+                    optimizer_step_started = time.perf_counter()
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = batch["latents"]
@@ -2248,11 +2259,12 @@ class NetworkTrainer:
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
+                    optimizer_step_seconds = time.perf_counter() - optimizer_step_started
                     if global_step == 0:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
-                    if getattr(args, "loraga", False):
+                    if hasattr(self, "_loraga_progress"):
                         self._loraga_progress = {"global_step": global_step, "epoch": epoch, "next_batch": step + 1}
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
@@ -2282,6 +2294,7 @@ class NetworkTrainer:
                     self.on_completed_optimizer_step(
                         args, accelerator, network, transformer, noise_scheduler, dit_dtype, network_dtype, global_step
                     )
+                    optimizer_step_started = None
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -2299,6 +2312,8 @@ class NetworkTrainer:
                     logs.update(loss_metrics)
                     logs.update(grad_metrics)
                     logs.update(self.extra_step_logs(args, logs))
+                    if accelerator.sync_gradients and getattr(args, "validation_dataset_config", None):
+                        logs["train/optimizer_step_seconds"] = optimizer_step_seconds
                     accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:

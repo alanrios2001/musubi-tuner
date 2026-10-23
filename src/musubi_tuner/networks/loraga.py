@@ -18,7 +18,18 @@ def initialize_factors(gradient, rank, scaling, direction="ArB2r", scale="stable
     gradient = gradient.detach().to(device=device, dtype=torch.float32)
     if not torch.isfinite(gradient).all() or not gradient.count_nonzero():
         raise ValueError("LoRA-GA gradient must be finite and nonzero")
-    u, _, v = torch.svd_lowrank(gradient, q=min(4 * rank, min(gradient.shape)), niter=4)
+    # A float32 input alone does not guarantee float32 randomized-SVD products:
+    # an outer autocast context can downcast them (or make CUDA QR fail).
+    # TF32 is useful for BF16 gradient operands, but not for the FP32 SVD basis.
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        if gradient.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = False
+        with torch.autocast(device_type=gradient.device.type, enabled=False):
+            u, _, v = torch.svd_lowrank(gradient, q=min(4 * rank, min(gradient.shape)), niter=4)
+    finally:
+        if gradient.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     if direction == "ArB2r":
         b, a = u[:, rank : 2 * rank], v[:, :rank].T
     elif direction == "A2rBr":
